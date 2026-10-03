@@ -1,0 +1,61 @@
+# Local infrastructure only. The Node services run on the host with
+# `npm run dev` and reach these containers on localhost.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: store
+      POSTGRES_PASSWORD: store # local-only default
+    ports:
+      - "5433:5432" # 5433 on the host, so it doesn't clash with a local Postgres on 5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Creates one database per service, only when the volume is first created.
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # TCP check: during first-run init, Postgres only listens on its socket.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U store -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Until project 1 phase 0 moves the services to Postgres.
+  mongo:
+    image: mongo:8.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  redis:
+    image: redis:8-alpine
+    # AOF on: from project 1, Redis holds live sale stock, not just cache.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672" # management UI: http://localhost:15672 (guest / guest)
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.54
+    environment:
+      - MEILI_ENV=development # no master key locally; search preview UI on :7700
+    ports:
+      - "7700:7700"
+    volumes:
+      - meili-data:/meili_data
+
+volumes:
+  postgres-data:
+  mongo-data:
+  redis-data:
+  rabbitmq-data:
+  meili-data:

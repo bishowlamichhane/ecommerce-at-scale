@@ -1,0 +1,19 @@
+import dotenv from "dotenv"
+dotenv.config({
+    path:"./.env"
+})
+import app from "./app.js"
+import connectDB from "./db/db.js"
+import { startRabbitConsumer } from "./utils/messageQueue.js"
+const port = process.env.PORT || 5004
+
+connectDB()
+.then(()=>{
+    app.listen(port,()=>{
+        console.log("App listening at port:",port)
+    });
+    startRabbitConsumer();
+})
+.catch((err)=>{
+    console.log("MongoDB connection FAILED !!",err)
+})
