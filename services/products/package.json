@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon -r dotenv/config --experimental-json-modules index.js"
+    "dev": "nodemon -r dotenv/config --experimental-json-modules index.js",
+    "sale:reset": "node -r dotenv/config scripts/flash-sale.js reset",
+    "sale:report": "node -r dotenv/config scripts/flash-sale.js report"
   },
   "keywords": [],
   "author": "",
