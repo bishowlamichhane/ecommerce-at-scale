@@ -55,7 +55,7 @@ taking Redis away.
 
 ## Tests
 
-`npm test` runs 106 tests against real Postgres and Redis, in test databases
+`npm test` runs 144 tests against real Postgres and Redis, in test databases
 of their own:
 
 | Suite | Tests | Covers |

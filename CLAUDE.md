@@ -121,7 +121,7 @@ npm run worker:inventory / worker:orders       # start a worker on its own
 npm run seed           # 1,000 generated products (with the stack running)
 npm run sale -- 10     # a flash sale of 10 units; resets its orders, carts and rate limits
 npm run sale:report    # units sold, orders by status, open reservations
-npm test               # all 106 tests (needs the containers)
+npm test               # all 144 tests (needs the containers)
 ```
 
 Under the hood, `scripts/dev.mjs` runs each package's own `npm run dev`
