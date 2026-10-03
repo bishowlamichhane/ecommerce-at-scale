@@ -10,6 +10,23 @@ let pool;
 
 export const query = (text, params) => pool.query(text, params);
 
+// Runs `work(client)` inside BEGIN/COMMIT, and rolls back if it throws.
+// Every query in `work` must use the client it's given, not query() above.
+export const withTransaction = async (work) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 const connectDB = async () => {
   try {
     pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });

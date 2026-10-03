@@ -8,7 +8,6 @@ const Cart = () => {
 
     const checkout = async () => {
         let bodyData = {
-            userId: 'bishow123',
             shipping_address: 'Kathmandu, Dhapasi-7',
             billing_address: 'Kathmandu, Dhapasi-7'
         }

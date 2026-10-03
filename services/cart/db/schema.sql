@@ -20,3 +20,10 @@ CREATE TABLE IF NOT EXISTS cart_items (
 );
 
 CREATE INDEX IF NOT EXISTS cart_items_cart_id_idx ON cart_items (cart_id);
+
+-- Project 1: one cart per shopper, identified by the X-User-Id header.
+-- Carts from the old shared-cart days become the 'guest' cart; if a race
+-- ever left more than one of them, keep the oldest so the index can exist.
+ALTER TABLE carts ADD COLUMN IF NOT EXISTS user_id text NOT NULL DEFAULT 'guest';
+DELETE FROM carts a USING carts b WHERE a.user_id = b.user_id AND a.id > b.id;
+CREATE UNIQUE INDEX IF NOT EXISTS carts_user_id_key ON carts (user_id);

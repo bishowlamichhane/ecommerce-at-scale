@@ -4,7 +4,9 @@ import App from './App.jsx'
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 import Cart from './components/Cart.jsx';
 import Home from './Home.jsx';
+import { setupShopperId } from './utils/shopperId.js';
 
+setupShopperId();
 
 const router = createBrowserRouter([
     {

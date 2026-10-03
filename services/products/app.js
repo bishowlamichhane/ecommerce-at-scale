@@ -14,7 +14,9 @@ export const cache = new NodeCache({stdTTL:60});
 
 
 import productRouter from "./routes/products.routes.js"
+import inventoryRouter from "./routes/inventory.routes.js"
 
+app.use('/inventory',inventoryRouter)
 app.use('/',productRouter)
 
 

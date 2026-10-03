@@ -1,6 +1,16 @@
-// Flash-sale load test for k6. Runs through Docker, so nothing to install:
+// Flash-sale load test for k6.
 //
-//   docker run --rm -i -e PRODUCT_ID=1001 -e USERS=500 grafana/k6 run - < loadtest/flash-sale.js
+//   k6 run -e BASE_URL=http://localhost:5000 -e PRODUCT_ID=1001 -e USERS=200 loadtest/flash-sale.js
+//
+// Or through Docker, with nothing to install:
+//
+//   docker run --rm -i -e PRODUCT_ID=1001 -e USERS=200 grafana/k6 run - < loadtest/flash-sale.js
+//
+// On Windows, prefer the native k6 binary (a single .exe from the k6 GitHub
+// releases): under a burst, Docker's host.docker.internal hop timed out some
+// connections. Keep USERS at 200 or below on a Windows laptop: beyond that the
+// gateway's listen queue overflows and connections are refused before they
+// reach the store (VERBOSE=1 shows them as status 0).
 //
 // Env vars:
 //   PRODUCT_ID  the sale product (printed by `npm run sale:reset`)
@@ -44,23 +54,25 @@ export default function () {
   const params = {
     headers: { "Content-Type": "application/json", "X-User-Id": `user-${__VU}` },
   };
-  const item = JSON.stringify({ productId: PRODUCT_ID, quantity: 1 });
+  const item = { productId: PRODUCT_ID, quantity: 1 };
+  const address = { billing_address: "Kathmandu", shipping_address: "Kathmandu" };
 
   let res;
   if (FLOW === "cart") {
-    http.post(`${BASE}/cart/add-to-cart`, item, params);
-    res = http.post(
-      `${BASE}/orders/place-order`,
-      JSON.stringify({ billing_address: "Kathmandu", shipping_address: "Kathmandu" }),
-      params
-    );
+    http.post(`${BASE}/cart/add-to-cart`, JSON.stringify(item), params);
+    res = http.post(`${BASE}/orders/place-order`, JSON.stringify(address), params);
   } else {
-    res = http.post(`${BASE}/orders/buy-now`, item, params);
+    res = http.post(`${BASE}/orders/buy-now`, JSON.stringify({ ...item, ...address }), params);
   }
 
   buyDuration.add(res.timings.duration);
   if (res.status === 201) created.add(1);
   else if (res.status === 409) soldOut.add(1);
   else if (res.status === 429) limited.add(1);
-  else failed.add(1);
+  else {
+    failed.add(1);
+    // VERBOSE=1 prints each unexpected answer; status 0 means no HTTP
+    // response at all (connection refused, reset, timeout).
+    if (__ENV.VERBOSE) console.log(`unexpected status=${res.status} error=${res.error} body=${String(res.body).slice(0, 120)}`);
+  }
 }

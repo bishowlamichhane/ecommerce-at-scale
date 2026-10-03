@@ -8,9 +8,7 @@ const ORDER_COLUMNS = `id, user_id, billing_address, shipping_address,
 // Writes the order and its items in one transaction, so an order can never
 // exist without its items.
 //
-// Like the Mongoose schema, this only knows `user_id`. The controller passes
-// `userId`, so every order still gets the default user (project 1 fixes it).
-// A missing value would be sent as NULL rather than the column default,
+// A missing user_id would be sent as NULL rather than the column default,
 // hence the COALESCE.
 export const createOrder = ({ user_id, billing_address, shipping_address, totalPrice, items }) =>
   withTransaction(async (client) => {

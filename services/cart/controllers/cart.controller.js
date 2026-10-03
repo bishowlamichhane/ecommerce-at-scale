@@ -1,9 +1,12 @@
-import { deleteFirstCart, findCart, saveCart } from "../models/Cart.model.js"
+import { deleteCart, findCart, saveCart } from "../models/Cart.model.js"
 import ApiError from "../utils/ApiError.js"
 import ApiResponse from "../utils/ApiResponse.js"
 import asyncHandler from "../utils/asyncHandler.js"
 import axios from "axios"
 import breaker from "../utils/circuitBreaker.js"
+
+// There's no login yet: the shopper is whoever the X-User-Id header says.
+const shopperId = (req) => req.get("X-User-Id") || "guest"
 
 
 
@@ -31,7 +34,7 @@ const addToCart = asyncHandler(async (req, res) => {
         else if (quantity > product.stock)
             throw new ApiError(404, "Quantity more then stock amount")
 
-        let cart = await findCart();
+        let cart = await findCart(shopperId(req));
         if (!cart) {
             cart = { items: [], totalPrice: 0 }
         }
@@ -66,7 +69,7 @@ const addToCart = asyncHandler(async (req, res) => {
             return sum + itemTotal;
         }, 0)
 
-        cart = await saveCart(cart)
+        cart = await saveCart(cart, shopperId(req))
 
         return res.status(200).json(new ApiResponse(200, "Item added to cart", cart))
 
@@ -84,7 +87,7 @@ const getCartItems = asyncHandler(async (req, res) => {
 
     try {
 
-        const cart = await findCart();
+        const cart = await findCart(shopperId(req));
         console.log(cart)
 
         if (!cart) {
@@ -138,7 +141,7 @@ const removeFromCart = asyncHandler(async (req, res) => {
 
     try {
 
-        let cart = await findCart();
+        let cart = await findCart(shopperId(req));
 
         if (!cart || !cart.items.length) {
             throw new ApiError(404, "No items in cart")
@@ -167,7 +170,7 @@ const removeFromCart = asyncHandler(async (req, res) => {
             return sum + itemTotal
         }, 0);
         cart.totalPrice = totalPrice;
-        cart = await saveCart(cart);
+        cart = await saveCart(cart, shopperId(req));
         return res.status(200).json(new ApiResponse(200, "Items removed", { cart }))
 
     }
@@ -180,7 +183,7 @@ const removeFromCart = asyncHandler(async (req, res) => {
 const clearCart = asyncHandler(async (req, res) => {
 
     try {
-        const cart = await deleteFirstCart();
+        const cart = await deleteCart(shopperId(req));
 
         return res.status(200).json(new ApiResponse(200, "Cart cleared successfully", cart))
 

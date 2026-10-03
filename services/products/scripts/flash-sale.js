@@ -66,8 +66,13 @@ async function reset(stock) {
     [id]
   );
   await carts.query("DELETE FROM carts");
+  // The table appears once the products service has booted with phase 1's schema.
+  const { rows: [table] } = await products.query("SELECT to_regclass('reservations') AS name");
+  if (table.name)
+    await products.query("DELETE FROM reservations WHERE items @> $1::jsonb", [JSON.stringify([{ productId: id }])]);
 
   await redis.del(`stock:${id}`);
+  await deleteKeys("resv:*");
   await deleteKeys("products:*");
   await redis.set(initialStockKey(id), stock);
 
@@ -87,6 +92,12 @@ async function report() {
     [id]
   );
   const redisStock = await redis.get(`stock:${id}`);
+  // Anything still open after a run is stock that's neither sold nor returned.
+  const { rows: [open] } = await products.query(
+    "SELECT count(*)::int AS n FROM reservations WHERE status = 'reserved' AND items @> $1::jsonb",
+    [JSON.stringify([{ productId: id }])]
+  );
+  const openInRedis = await redis.zcard("resv:pending");
 
   console.log(JSON.stringify({
     productId: id,
@@ -96,6 +107,7 @@ async function report() {
     oversold: Math.max(0, sold.units - initial),
     postgresStockNow: product.stock,
     redisStockNow: redisStock === null ? null : redisStock,
+    openReservations: open.n + openInRedis,
   }, null, 2));
 }
 

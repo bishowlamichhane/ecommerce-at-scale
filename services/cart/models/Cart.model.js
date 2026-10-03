@@ -4,21 +4,20 @@ import { query, withTransaction } from "../db/db.js";
 //
 // The cart is handled like the Mongo document it used to be: the controller
 // edits a plain object in memory, and saveCart() writes the cart row and all
-// of its items in one transaction.
+// of its items in one transaction. Each shopper (userId) has one cart.
 
 // Mongo left unset fields out of a document; Postgres returns them as null.
 const dropNulls = (row) =>
   Object.fromEntries(Object.entries(row).filter(([, value]) => value !== null));
 
 // `db` is the pool's query() or a transaction client: both have .query().
-// Without a cartId it reads the first cart: the store still has one cart
-// shared by everybody (project 1 fixes that).
-const readCart = async (db, cartId) => {
-  const select = `SELECT id, total_price AS "totalPrice",
-    created_at AS "createdAt", updated_at AS "updatedAt" FROM carts`;
-  const { rows } = cartId
-    ? await db.query(`${select} WHERE id = $1`, [cartId])
-    : await db.query(`${select} ORDER BY id LIMIT 1`);
+const readCart = async (db, column, value) => {
+  const { rows } = await db.query(
+    `SELECT id, user_id AS "userId", total_price AS "totalPrice",
+       created_at AS "createdAt", updated_at AS "updatedAt"
+     FROM carts WHERE ${column} = $1`,
+    [value]
+  );
   if (!rows[0]) return null;
 
   const items = await db.query(
@@ -29,23 +28,19 @@ const readCart = async (db, cartId) => {
   return { ...rows[0], items: items.rows.map(dropNulls) };
 };
 
-export const findCart = () => readCart({ query });
+export const findCart = (userId) => readCart({ query }, "user_id", userId);
 
-export const saveCart = (cart) =>
+export const saveCart = (cart, userId) =>
   withTransaction(async (client) => {
-    let cartId = cart.id;
-    if (cartId) {
-      await client.query(
-        "UPDATE carts SET total_price = $2, updated_at = now() WHERE id = $1",
-        [cartId, cart.totalPrice]
-      );
-    } else {
-      const { rows } = await client.query(
-        "INSERT INTO carts (total_price) VALUES ($1) RETURNING id",
-        [cart.totalPrice]
-      );
-      cartId = rows[0].id;
-    }
+    // Upsert on user_id: if two first-time requests from the same shopper
+    // race, both end up writing the same cart instead of one failing.
+    const { rows } = await client.query(
+      `INSERT INTO carts (user_id, total_price) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET total_price = EXCLUDED.total_price, updated_at = now()
+       RETURNING id`,
+      [userId, cart.totalPrice]
+    );
+    const cartId = rows[0].id;
 
     // Replace the items wholesale, like saving a Mongo document did.
     await client.query("DELETE FROM cart_items WHERE cart_id = $1", [cartId]);
@@ -57,13 +52,13 @@ export const saveCart = (cart) =>
       );
     }
 
-    return readCart(client, cartId);
+    return readCart(client, "id", cartId);
   });
 
 // Like Mongo's findOneAndDelete(): returns the cart it deleted, or null.
-export const deleteFirstCart = () =>
+export const deleteCart = (userId) =>
   withTransaction(async (client) => {
-    const cart = await readCart(client);
+    const cart = await readCart(client, "user_id", userId);
     if (cart) await client.query("DELETE FROM carts WHERE id = $1", [cart.id]);
     return cart;
   });
