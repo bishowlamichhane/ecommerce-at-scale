@@ -161,7 +161,11 @@ retries 8 times over 4 hours, then removes the webhook subscription
 - **Resilience fixes:**
   - ack messages only after success
   - a breaker fallback that works
-  - one breaker per downstream service
+  - one breaker per downstream service, with an `errorFilter` so 4xx answers
+    (404, 409 sold out) don't count as failures
+- **Load tests from inside Docker:** once every service runs in compose, k6
+  can share their network. On Windows the `host.docker.internal` hop times out
+  connections under a burst (project 1 spec, "Harness limits found").
 - **Observability:**
   - a correlation id passed from the gateway through Pub/Sub attributes
   - structured logs
