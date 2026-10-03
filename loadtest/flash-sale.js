@@ -51,8 +51,15 @@ export function setup() {
 }
 
 export default function () {
+  // Each buyer is its own client, with its own IP. The gateway only believes
+  // X-Forwarded-For when started with TRUST_PROXY=loopback; without it, all
+  // buyers share this machine's IP and the per-IP checkout limit applies.
   const params = {
-    headers: { "Content-Type": "application/json", "X-User-Id": `user-${__VU}` },
+    headers: {
+      "Content-Type": "application/json",
+      "X-User-Id": `user-${__VU}`,
+      "X-Forwarded-For": `10.${(__VU >> 16) & 255}.${(__VU >> 8) & 255}.${__VU & 255}`,
+    },
   };
   const item = { productId: PRODUCT_ID, quantity: 1 };
   const address = { billing_address: "Kathmandu", shipping_address: "Kathmandu" };

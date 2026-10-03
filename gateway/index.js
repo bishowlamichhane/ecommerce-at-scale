@@ -1,45 +1,27 @@
-import express from "express"
-import cors from "cors"
 import dotenv from "dotenv"
-import { createProxyMiddleware } from "http-proxy-middleware"
+import { loadConfig } from "./config.js"
+import { createApp } from "./app.js"
+import { createRedisClient } from "./redisClient.js"
+import { createRateLimiter } from "./ratelimit/limiter.js"
+import { POLICIES, compilePolicies } from "./ratelimit/policies.js"
 
-dotenv.config({ path: "./.env" }); 
-const app = express(); 
-app.use(cors());  
+dotenv.config({ path: "./.env" })
+const config = loadConfig()
+const { algorithm, failMode } = config.rateLimit
 
-const port = process.env.PORT || 5000
+// With rate limiting off there's nothing to connect to.
+const redis = algorithm === "off" ? null : createRedisClient(config.redis)
+const limiter = createRateLimiter({ redis, algorithm })
 
-
-// /inventory/* on the products service is for the orders service only.
-// Without this, anyone could reserve or release stock through the gateway.
-app.use("/products/inventory", (req, res) => {
-  res.status(404).json({ message: "Not found", success: false })
+const app = createApp({
+  services: config.services,
+  trustProxy: config.trustProxy,
+  limiter,
+  policies: compilePolicies(POLICIES),
+  failMode,
 })
 
-app.use("/products", createProxyMiddleware({
-  target: process.env.PRODUCT_SERVICE_URL,
-  changeOrigin: true,
-}))
-
-app.use("/cart", createProxyMiddleware({
-  target: process.env.CART_SERVICE_URL,
-  changeOrigin: true,
-}))
-
-app.use("/orders", createProxyMiddleware({
-  target: process.env.ORDERS_SERVICE_URL,
-  changeOrigin: true,
-}))
-
-app.use("/search", createProxyMiddleware({
-  target: process.env.SEARCH_SERVICE_URL,
-  changeOrigin: true,
-}))
-
-app.get("/", (req, res) => {
-  res.send("Gateway is up and running ")
-})
-
-app.listen(port, () => {
-  console.log(`Gateway listening on port ${port}`)
+app.listen(config.port, () => {
+  console.log(`Gateway listening on port ${config.port}`)
+  console.log(`Rate limiting: ${algorithm}${algorithm === "off" ? "" : ` (fails ${failMode})`}, trust proxy: ${config.trustProxy || "none"}`)
 })

@@ -74,6 +74,9 @@ async function reset(stock) {
   await redis.del(`stock:${id}`);
   await deleteKeys("resv:*");
   await deleteKeys("products:*");
+  // The gateway's rate-limit state: every run starts with full buckets, so the
+  // previous run's bots can't affect this one.
+  await deleteKeys("rl:*");
   await redis.set(initialStockKey(id), stock);
 
   console.log(`sale product ${id}: stock ${stock}, its orders and all carts cleared`);
@@ -98,12 +101,24 @@ async function report() {
     [JSON.stringify([{ productId: id }])]
   );
   const openInRedis = await redis.zcard("resv:pending");
+  // Who got the units: the bots-vs-humans load test names its bots "bot-…".
+  const { rows: bySide } = await orders.query(
+    `SELECT CASE WHEN o.user_id LIKE 'bot-%' THEN 'bots' ELSE 'humans' END AS side,
+            COALESCE(sum(oi.quantity), 0)::int AS units
+     FROM order_items oi JOIN orders o ON o.id = oi.order_id
+     WHERE oi.product_id = $1
+     GROUP BY 1`,
+    [id]
+  );
+  const soldTo = { humans: 0, bots: 0 };
+  for (const row of bySide) soldTo[row.side] = row.units;
 
   console.log(JSON.stringify({
     productId: id,
     initialStock: initial,
     ordersCreated: sold.orders,
     unitsSold: sold.units,
+    soldTo,
     oversold: Math.max(0, sold.units - initial),
     postgresStockNow: product.stock,
     redisStockNow: redisStock === null ? null : redisStock,
