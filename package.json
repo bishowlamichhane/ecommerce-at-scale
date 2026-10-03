@@ -1,0 +1,18 @@
+{
+  "name": "ecommerce-at-scale",
+  "private": true,
+  "description": "A microservices store, scaled up one project at a time. Start with CLAUDE.md and docs/.",
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "dev": "node scripts/dev.mjs",
+    "worker:inventory": "npm --prefix services/products run worker",
+    "worker:orders": "npm --prefix services/orders run worker",
+    "seed": "node frontend/src/utils/addProduct.js",
+    "sale": "npm --prefix services/products run sale:reset --",
+    "sale:report": "npm --prefix services/products run sale:report",
+    "test": "npm --prefix gateway test && npm --prefix services/products test && npm --prefix services/orders test"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  }
+}

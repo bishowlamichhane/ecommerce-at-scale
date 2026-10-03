@@ -171,10 +171,15 @@ describe("gateway with rate limiting", () => {
     for (let i = 0; i < 11; i++) assert.equal((await buy(base, { "X-Forwarded-For": `198.51.100.${i}` })).status, 200);
   });
 
-  it("keeps the inventory endpoints closed", async () => {
+  it("keeps the services' internal endpoints closed", async () => {
     const base = await gateway();
-    const res = await buy(base, { "X-User-Id": "gina" }, "/products/inventory/reserve");
-    assert.equal(res.status, 404);
+    const attempts = [
+      buy(base, { "X-User-Id": "gina" }, "/products/inventory/reserve"),
+      fetch(`${base}/products/inventory/stale?olderThanMs=0`),
+      fetch(`${base}/orders/admin/queues`),
+      fetch(`${base}/ORDERS/ADMIN/queues/api/queues`),
+    ];
+    for (const res of await Promise.all(attempts)) assert.equal(res.status, 404);
     assert.equal(received.length, 0);
   });
 

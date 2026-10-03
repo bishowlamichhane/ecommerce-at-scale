@@ -2,7 +2,8 @@
 //
 //   npm run sale:reset -- 10   one product with 10 units, none of its orders,
 //                              no carts, no leftover Redis sale state
-//   npm run sale:report        units sold vs units that existed
+//   npm run sale:report        units sold vs units that existed, orders by status
+//   npm run sale:drain         waits until no order is Pending; says how long it took
 //
 // It talks to the databases directly, so it's a dev tool, not an API.
 // The cart and orders databases sit next to product_service on the same
@@ -31,7 +32,22 @@ const dbUrl = (database) => {
 const products = new pg.Client({ connectionString: process.env.DATABASE_URL });
 const orders = new pg.Client({ connectionString: dbUrl("orders_service") });
 const carts = new pg.Client({ connectionString: dbUrl("cart_service") });
-const redis = new Redis({ host: "localhost", port: 6379, lazyConnect: true });
+// Fail fast: with default settings a frozen Redis made this tool wait forever
+// (found by the paused-Redis drill). One attempt, short timeouts; the report
+// then carries on with what Postgres knows.
+const redis = new Redis({
+  host: process.env.REDIS_HOST || "localhost",
+  port: Number(process.env.REDIS_PORT || 6379),
+  lazyConnect: true,
+  connectTimeout: 2000,
+  commandTimeout: 2000,
+  enableOfflineQueue: false,
+  maxRetriesPerRequest: 0,
+  retryStrategy: () => null,
+});
+// Failures surface through the rejected commands; without a listener ioredis
+// would also print each one as an "unhandled error event".
+redis.on("error", () => {});
 
 const initialStockKey = (id) => `sale:${id}:initial`;
 
@@ -78,29 +94,61 @@ async function reset(stock) {
   // previous run's bots can't affect this one.
   await deleteKeys("rl:*");
   await redis.set(initialStockKey(id), stock);
+  // The storefront's sale page shows this product (GET /products/sale/current).
+  // The sales table appears once the products service has booted with phase 3's schema.
+  const { rows: [sales] } = await products.query("SELECT to_regclass('sales') AS name");
+  if (sales.name) {
+    await products.query("DELETE FROM sales");
+    await products.query("INSERT INTO sales (product_id) VALUES ($1)", [id]);
+  }
 
   console.log(`sale product ${id}: stock ${stock}, its orders and all carts cleared`);
   console.log(`PRODUCT_ID=${id}`);
 }
 
-async function report() {
+// Waits until no order for the sale product is Pending, then says how long
+// that took: how far the background jobs were behind when the load ended.
+async function drain() {
+  const id = await findSaleProductId();
+  if (!id) throw new Error("no sale product yet: run sale:reset first");
+  const started = Date.now();
+  for (;;) {
+    const { rows: [row] } = await orders.query(
+      `SELECT count(DISTINCT o.id) FILTER (WHERE o.status = 'Pending')::int AS pending,
+              count(DISTINCT o.id)::int AS total
+       FROM orders o JOIN order_items oi ON oi.order_id = o.id
+       WHERE oi.product_id = $1`,
+      [id]
+    );
+    const waited = Date.now() - started;
+    if (row.pending === 0) return console.log(`all ${row.total} orders finished, ${waited} ms after this started`);
+    if (waited > 120_000) return console.log(`${row.pending} of ${row.total} orders still Pending after 120 s`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+// Redis-side numbers are null when Redis is unreachable.
+const fromRedis = (redisUp, read) => (redisUp ? read() : null);
+
+async function report(redisUp) {
   const id = await findSaleProductId();
   if (!id) throw new Error("no sale product yet: run sale:reset first");
 
-  const initial = Number(await redis.get(initialStockKey(id)));
+  const initialValue = await fromRedis(redisUp, () => redis.get(initialStockKey(id)));
+  const initial = initialValue === null ? null : Number(initialValue);
   const { rows: [product] } = await products.query("SELECT stock FROM products WHERE id = $1", [id]);
   const { rows: [sold] } = await orders.query(
     `SELECT count(DISTINCT order_id)::int AS orders, COALESCE(sum(quantity), 0)::int AS units
      FROM order_items WHERE product_id = $1`,
     [id]
   );
-  const redisStock = await redis.get(`stock:${id}`);
+  const redisStock = await fromRedis(redisUp, () => redis.get(`stock:${id}`));
   // Anything still open after a run is stock that's neither sold nor returned.
   const { rows: [open] } = await products.query(
     "SELECT count(*)::int AS n FROM reservations WHERE status = 'reserved' AND items @> $1::jsonb",
     [JSON.stringify([{ productId: id }])]
   );
-  const openInRedis = await redis.zcard("resv:pending");
+  const openInRedis = await fromRedis(redisUp, () => redis.zcard("resv:pending"));
   // Who got the units: the bots-vs-humans load test names its bots "bot-…".
   const { rows: bySide } = await orders.query(
     `SELECT CASE WHEN o.user_id LIKE 'bot-%' THEN 'bots' ELSE 'humans' END AS side,
@@ -112,6 +160,15 @@ async function report() {
   );
   const soldTo = { humans: 0, bots: 0 };
   for (const row of bySide) soldTo[row.side] = row.units;
+  // Pending orders are still being confirmed by the background jobs.
+  const { rows: byStatus } = await orders.query(
+    `SELECT o.status, count(DISTINCT o.id)::int AS n
+     FROM orders o JOIN order_items oi ON oi.order_id = o.id
+     WHERE oi.product_id = $1
+     GROUP BY o.status`,
+    [id]
+  );
+  const ordersByStatus = Object.fromEntries(byStatus.map((row) => [row.status, row.n]));
 
   console.log(JSON.stringify({
     productId: id,
@@ -119,19 +176,25 @@ async function report() {
     ordersCreated: sold.orders,
     unitsSold: sold.units,
     soldTo,
-    oversold: Math.max(0, sold.units - initial),
+    ordersByStatus,
+    oversold: initial === null ? null : Math.max(0, sold.units - initial),
     postgresStockNow: product.stock,
-    redisStockNow: redisStock === null ? null : redisStock,
-    openReservations: open.n + openInRedis,
+    redisStockNow: redisStock,
+    openReservations: open.n + (openInRedis ?? 0),
+    ...(redisUp ? {} : { note: "Redis unreachable: Redis-side numbers are null" }),
   }, null, 2));
 }
 
 const [command, arg] = process.argv.slice(2);
 try {
-  await Promise.all([products.connect(), orders.connect(), carts.connect(), redis.connect()]);
-  if (command === "reset") await reset(Number(arg));
-  else if (command === "report") await report();
-  else throw new Error("usage: flash-sale.js reset <stock> | report");
+  await Promise.all([products.connect(), orders.connect(), carts.connect()]);
+  const redisUp = await redis.connect().then(() => true, () => false);
+  if (command === "reset") {
+    if (!redisUp) throw new Error("Redis isn't reachable, and a reset needs it");
+    await reset(Number(arg));
+  } else if (command === "report") await report(redisUp);
+  else if (command === "drain") await drain();
+  else throw new Error("usage: flash-sale.js reset <stock> | report | drain");
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;

@@ -104,20 +104,29 @@ export const reservePostgresLock = (reservationId, items) =>
     await insertReservation(client, reservationId, "reserved", items);
   });
 
+// 'reserved', 'committed', 'released', or 'unknown' when there's no such row.
+export const reservationStatus = async (reservationId) => {
+  const { rows } = await query("SELECT status FROM reservations WHERE id = $1", [reservationId]);
+  return rows[0]?.status ?? "unknown";
+};
+
 // The order exists, so the reservation is final. Only a 'reserved' row can
-// change, which makes a second commit (or a commit after a release) a no-op.
+// change, which makes repeating it safe. Returns the outcome: 'committed'
+// (now or before), or 'released' / 'unknown' when there's nothing to commit.
 export const commitDbReservation = async (reservationId) => {
   const { rowCount } = await query(
     `UPDATE reservations SET status = 'committed', updated_at = now()
      WHERE id = $1 AND status = 'reserved'`,
     [reservationId]
   );
-  return rowCount === 1;
+  return rowCount === 1 ? "committed" : reservationStatus(reservationId);
 };
 
-// The order failed, so the stock goes back. Same no-op rule as commit.
-export const releaseDbReservation = (reservationId) =>
-  withTransaction(async (client) => {
+// There's no order, so the stock goes back. Same rule: only a 'reserved' row
+// changes. Returns 'released' (now or before), or 'committed' when an order
+// already owns the stock, or 'unknown'.
+export const releaseDbReservation = async (reservationId) => {
+  const released = await withTransaction(async (client) => {
     const { rows } = await client.query(
       `UPDATE reservations SET status = 'released', updated_at = now()
        WHERE id = $1 AND status = 'reserved'
@@ -134,6 +143,31 @@ export const releaseDbReservation = (reservationId) =>
     }
     return true;
   });
+  return released ? "released" : reservationStatus(reservationId);
+};
+
+// Reservations still open after `olderThanMs`, oldest first: the order they
+// were made for either crashed or is about to commit (the sweeper asks the
+// orders database which).
+export const staleDbReservations = async (olderThanMs, limit) => {
+  const { rows } = await query(
+    `SELECT id, (extract(epoch FROM now() - created_at) * 1000)::bigint AS age_ms
+     FROM reservations
+     WHERE status = 'reserved' AND created_at < now() - make_interval(secs => $1 / 1000.0)
+     ORDER BY created_at
+     LIMIT $2`,
+    [olderThanMs, limit]
+  );
+  return rows.map((row) => ({ reservationId: row.id, state: "reserved", ageMs: Number(row.age_ms) }));
+};
+
+export const openDbReservations = async (productId) => {
+  const { rows } = await query(
+    "SELECT count(*)::int AS n FROM reservations WHERE status = 'reserved' AND items @> $1::jsonb",
+    [JSON.stringify([{ productId }])]
+  );
+  return rows[0].n;
+};
 
 // Redis mode: Redis already took the stock; this brings Postgres up to date
 // once the order exists. The reservation id works as an idempotency key: if

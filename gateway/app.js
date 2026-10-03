@@ -21,11 +21,15 @@ export function createApp({ services, trustProxy, limiter, policies, failMode, l
   app.use(identifyShopper)
   app.use(rateLimit({ limiter, policies, failMode, logger }))
 
-  // /inventory/* on the products service is for the orders service only.
-  // Without this, anyone could reserve or release stock through the gateway.
-  app.use("/products/inventory", (req, res) => {
-    res.status(404).json({ message: "Not found", success: false })
-  })
+  // Routes the services expose to each other, never to the internet:
+  //   /products/inventory/*  reserve, commit and release stock (for the orders service)
+  //   /orders/admin/*        Bull Board, which can retry and delete jobs
+  // Express matches these case-insensitively, so /ORDERS/ADMIN is refused too.
+  for (const internal of ["/products/inventory", "/orders/admin"]) {
+    app.use(internal, (req, res) => {
+      res.status(404).json({ message: "Not found", success: false })
+    })
+  }
 
   app.use("/products", createProxyMiddleware({ target: services.products, changeOrigin: true }))
   app.use("/cart", createProxyMiddleware({ target: services.cart, changeOrigin: true }))

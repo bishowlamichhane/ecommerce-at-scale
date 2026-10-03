@@ -5,6 +5,7 @@ const Cart = () => {
 
     const [cartItems, setCartItems] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [message, setMessage] = useState(null);
 
     const checkout = async () => {
         let bodyData = {
@@ -13,10 +14,16 @@ const Cart = () => {
         }
         try {
             const { data } = await axios.post(`http://localhost:5000/orders/place-order`, bodyData);
-            console.log(data.message);
+            setMessage({ ok: true, text: `Order #${data.message.id} is placed. Follow it under "My orders" on the Flash Sale page.` });
             setCartItems([]);
         } catch (error) {
-            console.error('Error checking out', error);
+            const response = error.response;
+            const text = response?.status === 429
+                ? `Too many tries. Try again in ${response.headers['retry-after'] || 1} s.`
+                : response?.status === 409
+                    ? 'Something in your cart just sold out.'
+                    : response?.data?.message || error.message;
+            setMessage({ ok: false, text });
         }
     }
     const fetchCartItems = async () => {
@@ -81,6 +88,7 @@ const Cart = () => {
                 <p>Total Products:{cartItems.length}</p>
                 <p>Total Price: {cartItems.reduce((total, item) => total + item.price * item.quantity, 0).toFixed(2)}</p>
                 <button className='bg-blue-500 text-white px-4 py-2' onClick={checkout}>Checkout</button>
+                {message && <p className={message.ok ? 'text-green-400' : 'text-red-400'}>{message.text}</p>}
             </div>
         </div>
     )

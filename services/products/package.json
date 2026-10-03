@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "nodemon -r dotenv/config --experimental-json-modules index.js",
     "sale:reset": "node -r dotenv/config scripts/flash-sale.js reset",
-    "sale:report": "node -r dotenv/config scripts/flash-sale.js report"
+    "sale:report": "node -r dotenv/config scripts/flash-sale.js report",
+    "worker": "node -r dotenv/config worker.js",
+    "dev:worker": "nodemon -r dotenv/config worker.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "sale:drain": "node -r dotenv/config scripts/flash-sale.js drain"
   },
   "keywords": [],
   "author": "",
@@ -15,6 +19,7 @@
   "dependencies": {
     "amqplib": "^0.10.9",
     "axios": "^1.13.1",
+    "bullmq": "^6.3.11",
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",

@@ -5,7 +5,7 @@ dotenv.config({
 import app from "./app.js"
 import connectDB from "./db/db.js"
 import { connectRabbitMQ } from "./utils/messageQueue.js"
-import { checkoutMode } from "./controllers/inventory.controller.js"
+import { checkoutMode } from "./utils/inventoryActions.js"
 const port = process.env.PORT || 5001
 
 connectDB()

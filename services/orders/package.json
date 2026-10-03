@@ -4,17 +4,24 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon -r dotenv/config --experimental-json-modules index.js"
+    "dev": "nodemon -r dotenv/config --experimental-json-modules index.js",
+    "worker": "node -r dotenv/config worker.js",
+    "dev:worker": "nodemon -r dotenv/config worker.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\""
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@bull-board/api": "^9.10.2",
+    "@bull-board/express": "^9.10.2",
     "axios": "^1.12.2",
+    "bullmq": "^6.3.11",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "ioredis": "^5.11.1",
     "nodemon": "^3.1.10",
     "opossum": "^9.0.0",
     "pg": "^8.23.1"

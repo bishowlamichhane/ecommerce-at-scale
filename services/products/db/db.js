@@ -27,7 +27,11 @@ export const withTransaction = async (work) => {
   }
 };
 
-const connectDB = async () => {
+export const closeDB = () => pool?.end();
+
+// handleSignals: close the pool and exit on Ctrl+C. The worker turns it off
+// so it can first finish the jobs it's working on.
+const connectDB = async ({ handleSignals = true } = {}) => {
   try {
     pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -37,7 +41,7 @@ const connectDB = async () => {
     const { rows } = await pool.query("SELECT current_database() AS db");
     console.log(`✅ Postgres connected: ${rows[0].db}`);
 
-    process.on("SIGINT", async () => {
+    if (handleSignals) process.on("SIGINT", async () => {
       await pool.end();
       console.log("🔒 Postgres pool closed due to app termination");
       process.exit(0);

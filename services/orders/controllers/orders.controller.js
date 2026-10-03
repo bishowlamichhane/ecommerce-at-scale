@@ -2,17 +2,23 @@ import axios from "axios";
 import { randomUUID } from "node:crypto";
 import asyncHandler from "../utils/asyncHandler.js";
 import ApiError from "../utils/ApiError.js";
-import { createOrder, findOrderById } from "../models/Order.model.js";
+import { createOrder, findNotificationsByUser, findOrderById, findOrdersByUser } from "../models/Order.model.js";
 import ApiResponse from "../utils/ApiResponse.js";
 import breaker from "../utils/circuitBreaker.js";
-import { commitStock, releaseStock, reserveStock, toApiError } from "../utils/inventory.js";
+import { releaseStock, reserveStock, toApiError } from "../utils/inventory.js";
+import { enqueueOrderFlow } from "../utils/queues.js";
 
 // There's no login yet: the shopper is whoever the X-User-Id header says.
 const shopperId = (req) => req.get("X-User-Id") || "guest";
 
-// Shared by checkout and buy-now. Take the stock first, then write the order.
-// If writing the order fails, the stock goes back. The commit then tells
-// products the order exists (in redis mode, that's when Postgres catches up).
+// Shared by checkout and buy-now. Take the stock, then save the order. If
+// saving fails, the stock goes back right away.
+//
+// The buyer gets an answer as soon as the order is saved (status Pending).
+// The rest happens in the background: commit-stock makes the stock final,
+// then confirm-order confirms the order and emails the buyer. If Redis can't
+// take those jobs right now, the order stays Pending and the sweeper
+// (jobs/reconcile.js) queues them within a minute.
 //
 // items: [{ id, name, price, quantity }], where id is the product id
 const reserveAndCreateOrder = async ({ userId, items, totalPrice, billing_address, shipping_address }) => {
@@ -24,18 +30,24 @@ const reserveAndCreateOrder = async ({ userId, items, totalPrice, billing_addres
 
     let order;
     try {
-        order = await createOrder({ user_id: userId, items, totalPrice, billing_address, shipping_address });
+        order = await createOrder({
+            user_id: userId,
+            reservation_id: reservationId,
+            items,
+            totalPrice,
+            billing_address,
+            shipping_address,
+        });
     } catch (error) {
+        // If this release fails too, the sweeper releases the stock later:
+        // no order will ever claim this reservation.
         await releaseStock(reservationId).catch((e) =>
             console.error(`Release failed for reservation ${reservationId}:`, e.message));
         throw error;
     }
 
-    // The order exists and its stock is taken. A failed commit only means
-    // Postgres lags behind in redis mode, so it's logged, not returned as a
-    // failure. Phase 3 turns this into a job that retries.
-    await commitStock(reservationId).catch((e) =>
-        console.error(`Commit failed for reservation ${reservationId}:`, e.message));
+    await enqueueOrderFlow({ orderId: order.id, reservationId }).catch((e) =>
+        console.error(`Couldn't queue order ${order.id} (the sweeper will):`, e.message));
 
     return order;
 }
@@ -128,6 +140,18 @@ const checkStatusById = asyncHandler(async (req, res) => {
 })
 
 
+// The shopper's latest orders with their status; the sale page polls this to
+// show Pending turning into Processing (confirmed) or Cancelled.
+const myOrders = asyncHandler(async (req, res) => {
+    const orders = await findOrdersByUser(shopperId(req));
+    return res.status(200).json(new ApiResponse(200, "Your orders", orders));
+})
+
+// The shopper's simulated inbox: the emails the confirmation job "sent".
+const myNotifications = asyncHandler(async (req, res) => {
+    const notifications = await findNotificationsByUser(shopperId(req));
+    return res.status(200).json(new ApiResponse(200, "Your notifications", notifications));
+})
 
 
-export { placeOrder, buyNow, checkStatusById }
+export { placeOrder, buyNow, checkStatusById, myOrders, myNotifications }

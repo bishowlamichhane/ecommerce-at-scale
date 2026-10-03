@@ -1,80 +1,55 @@
 import ApiError from "../utils/ApiError.js";
 import ApiResponse from "../utils/ApiResponse.js";
 import asyncHandler from "../utils/asyncHandler.js";
+import { normalizeItems } from "../models/Inventory.model.js";
 import {
-  applyRedisCommit,
-  commitDbReservation,
-  normalizeItems,
-  releaseDbReservation,
-  reserveNaive,
-  reservePostgres,
-  reservePostgresLock,
-} from "../models/Inventory.model.js";
-import {
-  forgetRedisReservation,
-  getRedisReservation,
-  releaseRedis,
-  reserveRedis,
-} from "../utils/inventoryRedis.js";
+  checkoutMode,
+  commitReservation,
+  releaseReservation,
+  reserveStock,
+  staleReservations,
+} from "../utils/inventoryActions.js";
 
-// How stock is taken at checkout. Restart the service to switch; the load
-// test runs the same requests against each mode. See
-// docs/projects/01-flash-sale.md for what each one does.
-const MODES = ["naive", "postgres", "postgres-lock", "redis"];
-
-export const checkoutMode = () => {
-  const mode = process.env.CHECKOUT_MODE || "postgres";
-  if (!MODES.includes(mode)) throw new Error(`CHECKOUT_MODE must be one of: ${MODES.join(", ")}`);
-  return mode;
-};
+// These endpoints are for the orders service only; the gateway refuses
+// /products/inventory/* from outside. The logic lives in
+// utils/inventoryActions.js, shared with the background worker.
 
 const requireReservationId = (body) => {
   if (!body?.reservationId) throw new ApiError(400, "reservationId is required");
   return String(body.reservationId);
 };
 
-// These endpoints are for the orders service only; the gateway refuses
-// /products/inventory/* from outside.
-
 // Take the stock for every item, or answer 409 (sold out) / 404 and take nothing.
 const reserve = asyncHandler(async (req, res) => {
   const reservationId = requireReservationId(req.body);
   const items = normalizeItems(req.body.items);
-  const mode = checkoutMode();
-
-  if (mode === "naive") await reserveNaive(reservationId, items);
-  else if (mode === "postgres") await reservePostgres(reservationId, items);
-  else if (mode === "postgres-lock") await reservePostgresLock(reservationId, items);
-  else await reserveRedis(reservationId, items);
-
-  return res.status(200).json(new ApiResponse(200, "Stock reserved", { reservationId, mode }));
+  await reserveStock(reservationId, items);
+  return res.status(200).json(new ApiResponse(200, "Stock reserved", { reservationId, mode: checkoutMode() }));
 });
 
-// The order now exists: make the reservation final. Safe to repeat.
+// The order exists: make the stock final. Normally the commit-stock job does
+// this; the endpoint stays for manual use and tests.
 const commit = asyncHandler(async (req, res) => {
   const reservationId = requireReservationId(req.body);
-
-  let committed;
-  if (checkoutMode() === "redis") {
-    const items = await getRedisReservation(reservationId);
-    committed = items ? await applyRedisCommit(reservationId, items) : false;
-    if (items) await forgetRedisReservation(reservationId);
-  } else {
-    committed = await commitDbReservation(reservationId);
-  }
-
-  return res.status(200).json(new ApiResponse(200, "Commit handled", { reservationId, committed }));
+  const status = await commitReservation(reservationId);
+  return res.status(200).json(new ApiResponse(200, "Commit handled", { reservationId, status }));
 });
 
-// The order failed: put the stock back. Safe to repeat.
+// No order will use the stock: give it back.
 const release = asyncHandler(async (req, res) => {
   const reservationId = requireReservationId(req.body);
-
-  const released = checkoutMode() === "redis"
-    ? await releaseRedis(reservationId)
-    : await releaseDbReservation(reservationId);
-
-  return res.status(200).json(new ApiResponse(200, "Release handled", { reservationId, released }));
+  const status = await releaseReservation(reservationId);
+  return res.status(200).json(new ApiResponse(200, "Release handled", { reservationId, status }));
 });
 
-export { reserve, commit, release };
+// Reservations still open after ?olderThanMs=, for the orders service's sweeper.
+const stale = asyncHandler(async (req, res) => {
+  const olderThanMs = Number(req.query.olderThanMs);
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  if (!Number.isInteger(olderThanMs) || olderThanMs < 0)
+    throw new ApiError(400, "olderThanMs must be a non-negative integer");
+  const reservations = await staleReservations(olderThanMs, limit);
+  return res.status(200).json(new ApiResponse(200, "Stale reservations", { reservations }));
+});
+
+export { reserve, commit, release, stale };

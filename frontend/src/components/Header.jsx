@@ -47,7 +47,10 @@ const Header = ({ setSearchItems, setSearchResponse, setSearchIds }) => {
         <IoSearch size={24} className='ml-2' />
       </div>
 
-      <div> <button className='cursor-pointer' onClick={() => navigate('/cart')}>Cart</button></div>
+      <div className='flex gap-6'>
+        <button className='cursor-pointer text-amber-300' onClick={() => navigate('/flash-sale')}>⚡ Flash Sale</button>
+        <button className='cursor-pointer' onClick={() => navigate('/cart')}>Cart</button>
+      </div>
     </div>
 
   )

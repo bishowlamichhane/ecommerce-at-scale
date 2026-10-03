@@ -38,3 +38,12 @@ CREATE TABLE IF NOT EXISTS reservations (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Project 1, phase 3: the product the storefront's sale page shows (`npm run
+-- sale:reset` sets it). It's business data, so it lives in Postgres: the sale
+-- page keeps working while Redis is down.
+CREATE TABLE IF NOT EXISTS sales (
+  id         integer     GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  product_id integer     NOT NULL REFERENCES products (id) ON DELETE CASCADE,
+  started_at timestamptz NOT NULL DEFAULT now()
+);

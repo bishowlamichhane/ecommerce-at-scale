@@ -1,6 +1,6 @@
 -- Reserve every item of an order, or nothing.
 --
--- KEYS[1]     resv:<reservationId>  hash: stock key -> quantity taken
+-- KEYS[1]     resv:<reservationId>  hash: stock key -> quantity taken, plus 'state'
 -- KEYS[2]     resv:pending          sorted set of open reservations, scored by time
 -- KEYS[3..n]  stock:<productId>     one per item (a number, or 'untracked')
 -- ARGV[1]     reservation id
@@ -30,5 +30,7 @@ for i = 1, items do
   end
   redis.call('HSET', KEYS[1], KEYS[i + 2], ARGV[i + 2])
 end
+-- 'reserved' until an order claims it (claim.lua sets 'committing')
+redis.call('HSET', KEYS[1], 'state', 'reserved')
 redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
 return 0
