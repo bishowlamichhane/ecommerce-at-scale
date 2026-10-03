@@ -4,8 +4,9 @@ Context for Claude Code sessions in this repo. Keep it current: when a project
 ships or the architecture changes, update this file in the same change.
 
 **Current focus: Project 1, Flash Sale Mode (Redis).** Phases 0 (MongoDB →
-Postgres) and 1 (atomic stock reservations) are done; phase 2, rate limiting,
-is next. The spec, checklist and every measured result are in
+Postgres), 1 (atomic stock reservations) and 2 (GCRA rate limiting in the
+gateway) are done; phase 3, async work with BullMQ, is next. The spec,
+checklist and every measured result are in
 [docs/projects/01-flash-sale.md](docs/projects/01-flash-sale.md). Read the spec
 before working on any project task.
 
@@ -50,7 +51,8 @@ archive and don't copy files from it.
 ```
 frontend (Vite + React 19, :5173): calls http://localhost:5000, sends X-User-Id
    │
-gateway (:5000): http-proxy-middleware, strips the prefix
+gateway (:5000): CORS → X-User-Id check (400 if malformed) → GCRA rate limiter (Redis,
+   │             rl:gcra:* keys) → http-proxy-middleware, which strips the prefix:
    │             /products  /cart  /orders  /search   (answers 404 for /products/inventory/*)
    ├── products (:5001): Postgres product_service (products, reservations)
    │      ├── /inventory/reserve|commit|release: internal, for orders; CHECKOUT_MODE picks how
@@ -69,6 +71,15 @@ Requests flow `routes/` → `controllers/` → `models/`. The models hold plain 
 that runs through `pg`, with the pool in `db/db.js` and the tables in
 `db/schema.sql`. `utils/` holds `ApiError`, `ApiResponse`, `asyncHandler`,
 `circuitBreaker` and similar helpers.
+
+The gateway is laid out differently:
+- `index.js` reads the env through `config.js`, which fails fast on bad
+  values.
+- `app.js` builds the app, so tests can start it.
+- `redisClient.js` holds the fail-fast Redis client.
+- `ratelimit/` holds the Lua scripts, `policies.js` (every limit and its
+  reason), `limiter.js`, `middleware.js`, `headers.js` and `identity.js`.
+- `test/` holds the tests.
 
 ## Running locally
 
@@ -98,10 +109,23 @@ To switch modes, set `CHECKOUT_MODE` in `services/products/.env` and restart
 products. On this Windows laptop, keep k6 at 200 or fewer simultaneous
 buyers and run it natively, not in Docker; the spec explains why.
 
+Load tests simulate many clients from one machine. So start the gateway with
+`TRUST_PROXY=loopback`, which makes it believe the X-Forwarded-For each k6
+client sends. Otherwise every buyer shares one IP and the per-IP checkout limit
+refuses them. `RATE_LIMIT_ALGORITHM=off` reproduces the phase 1 numbers.
+`npm run sale:reset` also clears the rate-limit state. The rate-limit load
+tests are `loadtest/bots-vs-humans.js` and `loadtest/gateway-overhead.js`.
+
+Tests:
+
+```bash
+cd gateway && npm test     # 69 tests; needs Redis running, uses (and wipes) Redis database 15
+```
+
 Start the containers before the services. products crashes if RabbitMQ is
 down, because `connectRabbitMQ()` is neither awaited nor retried. search never
-retries its consumer. There are no automated tests yet. Frontend lint is
-`npm run lint`.
+retries its consumer. Only the gateway has automated tests so far. Frontend
+lint is `npm run lint`.
 
 Postgres listens on host port **5433**, so it doesn't clash with another local
 Postgres on 5432. `docker/postgres/init.sql` creates the databases only when
@@ -122,7 +146,16 @@ data included.
 - `stock IS NULL` means the product doesn't track stock and can always be
   bought. The seed data has no stock.
 - The shopper is the `X-User-Id` header, or `guest` if it's missing. There's no
-  auth yet. Carts and orders are keyed by it.
+  auth yet. Carts and orders are keyed by it. The gateway refuses malformed ids
+  with a 400 (1–64 of `[A-Za-z0-9._:@-]`). Because any client can make one up,
+  the shopper id is never the only rate limit: every policy also limits by IP.
+- Rate limits live in `gateway/ratelimit/policies.js`. A change to a number
+  needs its reason next to it, and the gateway tests must still pass. Keep
+  the limiter atomic: one script call per request, checking all of the
+  request's limits.
+- Only believe `X-Forwarded-For` through `TRUST_PROXY`, naming the proxy (for
+  example loopback for load tests, or a CDN's ranges in production). Never
+  set it to `true`; `config.js` refuses that.
 - Controllers call `new ApiResponse(status, "text", payload)`, but the
   constructor's signature is `(statusCode, data, message)`. So the payload
   lands in `.message`, and the frontend reads `res.data.message`. Don't fix
@@ -133,10 +166,11 @@ data included.
   one opossum breaker, shared by every downstream URL. Orders' calls to
   `/inventory/*` deliberately bypass it, because 409 "sold out" answers would
   open it.
-- Redis, RabbitMQ and Meilisearch hosts are hardcoded to `localhost` in
-  `redisClient.js`, both `messageQueue.js`, `meiliClient.js` and the `/sync` URL
-  in `search.controller.js`. That works on the host. Moving them to env vars is
-  part of project 4.
+- In the services, Redis, RabbitMQ and Meilisearch hosts are hardcoded to
+  `localhost` in `redisClient.js`, both `messageQueue.js`, `meiliClient.js` and
+  the `/sync` URL in `search.controller.js`. That works on the host. Moving
+  them to env vars is part of project 4. The gateway already reads
+  `REDIS_HOST` and `REDIS_PORT`.
 - Never delete `stock:*` keys during a redis-mode sale. They reload from
   Postgres, which doesn't include reservations that haven't committed yet.
 - Don't add `express.json()` to the gateway. It would consume request bodies
@@ -149,7 +183,8 @@ post material.
 
 | Bug | Where | Project |
 |---|---|---|
-| `KEYS products:*` blocks Redis, and `removeAllProducts` runs `flushall`, which would also wipe a running sale's counters and reservations | `utils/cacheClear.js`, `product.controller.js` | 1 (phase 4) |
+| `KEYS products:*` blocks Redis, and `removeAllProducts` runs `flushall`, which would also wipe a running sale's counters, its reservations and every rate limit | `utils/cacheClear.js`, `product.controller.js` | 1 (phase 4) |
+| The products service's Redis client uses ioredis defaults (offline queue, 20 retries), so while Redis is down, requests that touch it hang instead of failing fast. The gateway's `redisClient.js` shows the fix | `services/products/utils/redisClient.js` | 4 |
 | Nothing releases a reservation whose order never committed or released (a crash in between), so its stock stays held | `reservations`, `resv:pending` | 1 (phase 3) |
 | The search consumer indexes only name, price, stock, category and description, so search results lack image, colour and gender | `search/utils/messageQueue.js` | 2 |
 | The subcategory filter never applies: the frontend sends `subcategory`, the backend reads `subCategory` | `Categories.jsx`, `product.controller.js` | 2 |
@@ -163,7 +198,7 @@ post material.
 
 | # | Project | Status | Spec |
 |---|---|---|---|
-| 1 | Flash Sale Mode (Redis) | **active**, phase 2 next | [01-flash-sale.md](docs/projects/01-flash-sale.md) |
+| 1 | Flash Sale Mode (Redis) | **active**, phase 3 next | [01-flash-sale.md](docs/projects/01-flash-sale.md) |
 | 2 | Search 44k real products (Elasticsearch) | pipeline | [pipeline.md](docs/pipeline.md) |
 | 3 | Bulk catalog import (Supabase) | pipeline | [pipeline.md](docs/pipeline.md) |
 | 4 | Go to production (GCP, Cloudflare, Shopify webhooks) | pipeline | [pipeline.md](docs/pipeline.md) |

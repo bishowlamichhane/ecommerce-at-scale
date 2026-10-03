@@ -1,6 +1,6 @@
 # Project 1: Flash Sale Mode (Redis)
 
-- **Status:** active. Phases 0 and 1 are done; phase 2 (rate limiting) is next.
+- **Status:** active. Phases 0, 1 and 2 are done; phase 3 (async work with BullMQ) is next.
 - **Branch:** `p1-flash-sale`
 - **Estimate:** about 2 weeks part-time including the move to Postgres (about
   1.5 weeks for the "must" phases)
@@ -22,7 +22,8 @@ at once. Before this project the store failed that test:
    both read `stock: 1`, both pass the check and both write `0`. Two units get
    sold. *(Phase 1: naive mode keeps this on purpose so it can be measured.)*
 3. **Every shopper shared one cart**, and orders ignored the user. *(Fixed in phase 1.)*
-4. **There's no rate limiting.** One script can hammer checkout. *(Phase 2.)*
+4. **There was no rate limiting.** One script could hammer checkout, and bots
+   bought 84–88 of 100 units. *(Fixed in phase 2: 15 of 100.)*
 5. **Cache invalidation blocks Redis** (`KEYS products:*`). `removeAllProducts`
    also runs `flushall`, which would now also wipe the sale's stock counters
    and reservations. *(Phase 4.)*
@@ -118,12 +119,59 @@ How the redis mode works:
   `maxmemory-policy noeviction`, so if memory is ever capped for the cache, the
   queues get their own Redis.
 
+### Rate limiting (phase 2, done)
+
+It runs in the gateway, before anything is proxied. The code is in
+`gateway/ratelimit/`.
+
+- **Algorithm: GCRA** (`gcra.lua`). It's the Generic Cell Rate Algorithm, which
+  [Let's Encrypt moved its rate limits to in 2025](https://letsencrypt.org/2025/01/30/scaling-rate-limits/).
+  - Each client costs one number in Redis, its "theoretical arrival time".
+  - A limit is `burst` requests at once, plus one every `period / perPeriod`.
+  - There are no window edges to burst across. A fixed window leaks twice its
+    limit at every edge (measured below), so `fixedWindow.lua` stays only as
+    the baseline.
+- **One atomic call per request:**
+  - a policy's limits are all checked in a single script
+  - nothing is charged unless every limit allows it, so refused requests cost nothing
+  - time comes from the Redis server clock, so several gateway instances agree
+  - keys expire by themselves once a client's bucket is full again
+- **Policies** (`policies.js`, first match wins):
+
+  | Policy | Applies to | Per shopper | Per IP |
+  |---|---|---|---|
+  | checkout | any write under `/orders` | 3 at once, then 1 every 10 s | 10 at once, then 1/s |
+  | cart | any write under `/cart` | 10 at once, then 1/s | 50 at once, then 10/s |
+  | default | everything else | — | 100 at once, then 20/s |
+
+  Express routes `/ORDERS/BUY-NOW/` to the same handler, so the limiter
+  matches it as checkout too.
+- **Identity:**
+  - `X-User-Id` must be 1–64 of `[A-Za-z0-9._:@-]`, or the request gets a 400.
+  - Without the header only the IP limit applies, so there's no shared
+    "guest" bucket a single abuser could drain.
+  - IPv4-mapped addresses are unwrapped, and IPv6 is limited per /64.
+  - `X-Forwarded-For` is only believed from proxies named in `TRUST_PROXY`,
+    which refuses `true`.
+- **Headers:**
+  - `RateLimit-Policy` and `RateLimit` follow the IETF draft
+    ([draft-ietf-httpapi-ratelimit-headers-11](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)).
+  - 429s also carry `Retry-After`.
+  - All three are exposed to browsers through CORS.
+  - CORS answers preflight requests before the limiter sees them.
+- **When Redis fails:**
+  - the client never queues commands and gives up after 100 ms
+  - the limiter then fails open, or answers 503 with `RATE_LIMIT_FAIL_MODE=closed`
+  - it logs at most one warning per 10 s
+  - auto-pipelining batches the checks that land in the same tick
+- **Switches:** `RATE_LIMIT_ALGORITHM=gcra|fixed-window|off`. Keys look like
+  `rl:gcra:<limit>:<id>` or `rl:fw:…`, so switching algorithms can't hit
+  WRONGTYPE.
+- **Known limit:** the script needs every key on one Redis node. On Redis
+  Cluster, the user and IP keys would land in different slots.
+
 ### Still to build
 
-- **Rate limiter in the gateway (phase 2):** a sliding window in a Redis sorted
-  set on `/orders/*`. It's keyed by `X-User-Id`, falling back to IP, because
-  all k6 traffic comes from one IP. It replies 429 with `Retry-After` and
-  `X-RateLimit-*` headers.
 - **BullMQ (phase 3):** `commit-stock`, `send-confirmation` (a simulated email)
   and a repeatable `release-expired`. The last one sweeps `resv:pending` and
   `status = 'reserved'` rows older than N minutes; today nothing releases a
@@ -139,9 +187,11 @@ How the redis mode works:
 
 ### Dependencies
 
-- Added: `pg` in products, cart and orders (it replaced `mongoose`).
-- Planned: `ioredis` in the gateway (phase 2), plus `bullmq`,
-  `@bull-board/api` and `@bull-board/express` in products (phase 3).
+- Added: `pg` in products, cart and orders (it replaced `mongoose`), and
+  `ioredis` in the gateway (phase 2). Tests use Node's built-in `node:test`,
+  so there's no test framework dependency.
+- Planned: `bullmq`, `@bull-board/api` and `@bull-board/express` in products
+  (phase 3).
 - k6: the native binary, or the `grafana/k6` Docker image (see Results for why
   native).
 
@@ -179,8 +229,19 @@ How the redis mode works:
 - [x] Load-test all modes → Results
 
 ### Phase 2: rate limiting (must)
-- [ ] Sliding-window limiter in the gateway, with 429 and headers
-- [ ] Test: one abusive user gets limited, and normal users don't notice
+- [x] GCRA limiter in the gateway: atomic multi-limit Lua script, per shopper and per IP, 429 with IETF RateLimit headers and Retry-After
+- [x] Fixed-window baseline, plus a test proving its edge leak
+- [x] Edge cases:
+  - malformed or duplicate `X-User-Id`
+  - IPv6 /64 grouping
+  - spoofed `X-Forwarded-For`
+  - path spellings
+  - CORS preflight, and the exposed headers
+  - Redis down (fail open or closed)
+  - a Redis restart that clears the script cache
+- [x] Test suite: 69 tests (`cd gateway && npm test`). Three deliberate bugs, each caught
+- [x] Test: abusive users get limited and normal users don't notice. Bots vs humans, flood, overhead and regression runs → Results
+- [x] Live outage drill: stop Redis mid-traffic, then start it again
 
 ### Phase 3: async work (should)
 - [ ] BullMQ queue and worker for `commit-stock`, `send-confirmation` and `release-expired`
@@ -286,6 +347,112 @@ Every run below ended with zero open reservations.
   postgres 0, but 31–153 connection failures each) aren't in the tables. The
   correctness verdict was the same.
 
+### Phase 2: rate limiting
+
+**Setup:** every phase 2 load test ran with postgres checkout, native k6,
+the gateway started with `TRUST_PROXY=loopback` (so each simulated client
+gets its own IP), and the limiter state cleared before each run.
+
+**Tests:** `cd gateway && npm test` runs 69 tests:
+- GCRA math with a fixed clock
+- atomicity under 50 simultaneous requests
+- the fixed-window edge
+- identity parsing
+- the real gateway in front of a fake upstream
+- Redis down
+
+To check that the tests can actually fail, I added three bugs on purpose,
+one at a time, and restored the code after each:
+- letting one extra request through: 13 tests failed
+- charging refused requests: 5 failed
+- skipping path normalization: 1 failed
+
+**Window edge** (deterministic, from the test): with a limit of 5 per 10 s,
+send 20 requests within 15 ms of a window edge. Fixed window allowed **10**;
+GCRA allowed **5**.
+
+**Bots vs humans** (`loadtest/bots-vs-humans.js`):
+- 150 humans each buy once, at a random moment in the first 10 s.
+- 5 bot operators (one IP each) each run 10 parallel tasks that buy non-stop
+  for 10 s.
+- There are 100 units in stock.
+
+| Date | Limiter | Bot ids | Bots got | Humans got | Bot 429s | Human median | Human p95 |
+|---|---|---|---|---|---|---|---|
+| 2026-10-03 | off | fixed | **88** | 12 | 0 | 198 ms | 612 ms |
+| 2026-10-03 | off | fixed | **84** | 16 | 0 | 207 ms | 449 ms |
+| 2026-10-04 | gcra | fixed | **15** | **85** | 22,126 | 67 ms | 235 ms |
+| 2026-10-04 | gcra | fixed | **15** | **85** | 20,145 | 73 ms | 120 ms |
+| 2026-10-04 | gcra | rotating | 60 | 40 | 20,453 | 60 ms | 510 ms |
+| 2026-10-04 | gcra | rotating | 60 | 40 | 20,206 | 59 ms | 225 ms |
+
+**Flood:** the same traffic with unlimited stock, so every bot request that
+gets through is a full purchase.
+
+| Date | Limiter | Bot purchases | Human purchases | Bot 429s | Human median | Human p95 |
+|---|---|---|---|---|---|---|
+| 2026-10-04 | off | 1,464 | 150 | 0 | 338 ms | 574 ms |
+| 2026-10-04 | off | 1,475 | 150 | 0 | 323 ms | 593 ms |
+| 2026-10-04 | gcra | 15 | 150 | 21,669 | 73 ms | 115 ms |
+| 2026-10-04 | gcra | 15 | 150 | 22,104 | 74 ms | 101 ms |
+
+**What the limiter costs** (`loadtest/gateway-overhead.js`):
+- `GET /` is answered by the gateway itself, so the difference is the limiter.
+- Every request comes from a new IP, so none is refused.
+- Redis runs in Docker Desktop.
+- Auto-pipelining is on.
+
+| Load | Limiter | Median | p95 | p99 | Throughput |
+|---|---|---|---|---|---|
+| steady 500 req/s | off | 0.54 ms | 1.10 ms | 1.65 ms | 500/s |
+| steady 500 req/s | gcra | 1.91 ms | 3.28 ms | 5.01 ms | 500/s |
+| 50 users flat out | off | 14.6 ms | 23.5 ms | 31.1 ms | 3,154/s |
+| 50 users flat out | gcra | 18.2 ms | 25.1 ms | 30.6 ms | 2,586/s |
+
+Before auto-pipelining, flat out:
+
+| Limiter | Throughput | Median |
+|---|---|---|
+| off | 3,237/s | 14.3 ms |
+| gcra | 2,253/s | 21.0 ms |
+| fixed-window | 2,153/s | 21.9 ms |
+
+**Outage drill:** the stack served purchases while Redis was stopped, then
+started again.
+1. Redis up: one shopper's 4th purchase got a 429 in 5 ms.
+2. Redis stopped: 4 purchases were all served, in 33–37 ms. The gateway
+   logged one warning.
+3. Redis restarted, with its script cache empty: limiting resumed by itself,
+   and the 4th purchase got a 429 again.
+
+**Regression:** the phase 1 burst (200 buyers, 10 units) with the limiter on
+sold 10, answered 190 with "sold out", refused no real buyer, and had a
+median of 1.10 s.
+
+### What the numbers say (phase 2)
+
+1. **Against bots that keep one identity, the limiter turned the sale
+   around.** Bots went from 84–88 of 100 units to 15; humans went from
+   12–16 to 85. Humans' median answer fell from about 200 ms to about 70 ms,
+   because over 20,000 bot requests per run were refused at the gateway
+   instead of reaching orders and Postgres.
+2. **With unlimited stock,** bots made about 1,470 purchases in 10 s without
+   the limiter, and 15 with it. Humans' median fell from 323–338 ms to
+   73–74 ms.
+3. **Rotating `X-User-Id` brings bots back to 60 of 100.** A per-shopper limit
+   only binds clients that keep their identity. The per-IP layer is what held
+   them at 60. Going further takes a different tool:
+   - a randomized waiting room
+   - bot detection (Cloudflare Turnstile in project 4)
+   - per-customer purchase limits tied to real accounts
+4. **Fixed windows leak at their edges:** 10 requests through on a limit of 5,
+   within 15 ms. GCRA held at 5.
+5. **The cost:** about 1.4 ms per request at 500 req/s here (one Redis round
+   trip into Docker Desktop), and 18% of one process's peak throughput.
+   Auto-pipelining won back about a third of the original 30% loss.
+6. **A Redis outage doesn't take the store down.** Purchases kept their normal
+   speed with Redis stopped, and limiting came back on its own.
+
 ## Posts
 
 - **Optional, early:** why the store moved from MongoDB to Postgres before the
@@ -300,3 +467,14 @@ Every run below ended with zero open reservations.
   the queue.
 - **Side note** for any of them: "my laptop's TCP queue gave out before my code
   did" (the 500-buyer refusals).
+- **D, design (phase 2):** rate limiting a flash sale.
+  - GCRA in one picture: the theoretical arrival time moving along a timeline.
+  - Why not fixed windows: the edge test, 10 through on a limit of 5.
+  - Per-shopper plus per-IP limits, and why the shopper id alone isn't enough.
+  - Failing open.
+- **E, demo (phase 2):** "Bots bought 88 of 100 sneakers. With a rate
+  limiter, 15."
+  - Show the flood numbers: humans' median fell from 323–338 ms to 73–74 ms.
+  - Then the honest twist: rotating identities got the bots back to 60. A
+    rate limiter is a seatbelt, not the whole safety system, which leads
+    into the waiting room idea.

@@ -158,7 +158,14 @@ retries 8 times over 4 hours, then removes the webhook subscription
   - Cloudflare has a Kathmandu data center
     (<https://blog.cloudflare.com/kathmandu/>), so "server in Iowa, users in
     Kathmandu" is a real before/after
+- **Bot defense beyond rate limiting:** project 1 measured that bots rotating
+  `X-User-Id` from 5 IPs still took 60 of 100 units. Options:
+  - Cloudflare Turnstile on checkout
+  - Cloudflare's bot signals
+  - a waiting room that randomizes everyone who arrives in the first seconds
 - **Resilience fixes:**
+  - give the products service's Redis client the gateway's fail-fast
+    settings (no offline queue, a command timeout)
   - ack messages only after success
   - a breaker fallback that works
   - one breaker per downstream service, with an `errorFilter` so 4xx answers
