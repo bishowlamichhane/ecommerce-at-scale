@@ -3,12 +3,17 @@
 Context for Claude Code sessions in this repo. Keep it current: when a project
 ships or the architecture changes, update this file in the same change.
 
-**Current focus: Project 1, Flash Sale Mode (Redis).** Phases 0 (MongoDB →
-Postgres), 1 (atomic stock reservations) and 2 (GCRA rate limiting in the
-gateway) are done; phase 3, async work with BullMQ, is next. The spec,
-checklist and every measured result are in
+**Current focus: Project 1, Flash Sale Mode (Redis).** Done so far:
+- phase 0: MongoDB → Postgres
+- phase 1: atomic stock reservations
+- phase 2: GCRA rate limiting in the gateway
+- phase 3: background jobs with BullMQ, a self-healing sweeper and the sale page
+
+Phase 4, the read path (cache fixes), is next. The spec, checklist and every
+measured result are in
 [docs/projects/01-flash-sale.md](docs/projects/01-flash-sale.md). Read the spec
-before working on any project task.
+before working on any project task. [docs/try-it.md](docs/try-it.md) walks a
+person through everything from the browser.
 
 ## What this repo is
 
@@ -54,15 +59,23 @@ frontend (Vite + React 19, :5173): calls http://localhost:5000, sends X-User-Id
 gateway (:5000): CORS → X-User-Id check (400 if malformed) → GCRA rate limiter (Redis,
    │             rl:gcra:* keys) → http-proxy-middleware, which strips the prefix:
    │             /products  /cart  /orders  /search   (answers 404 for /products/inventory/*)
-   ├── products (:5001): Postgres product_service (products, reservations)
-   │      ├── /inventory/reserve|commit|release: internal, for orders; CHECKOUT_MODE picks how
+   │             (answers 404 for /orders/admin/* too)
+   ├── products (:5001): Postgres product_service (products, reservations, sales)
+   │      ├── /inventory/reserve|commit|release|stale: internal, for orders; CHECKOUT_MODE picks how
+   │      ├── /sale/current: the sale page's data (product, live / committed / pending stock)
    │      ├── Redis: listing cache products:{skip}:{limit} (TTL 60s); in redis mode also
-   │      │          stock:{id} counters, resv:{id} hashes and the resv:pending sorted set
+   │      │          stock:{id} counters, resv:{id} hashes (reserved → committing) and resv:pending
    │      └── RabbitMQ: publishes add/update/delete to queue product_updates
    ├── cart (:5002): Postgres cart_service, one cart per shopper; reads products through an opossum breaker
-   ├── orders (:5003): Postgres orders_service; checkout and buy-now both
-   │                   reserve stock → write the order → commit (or release)
+   ├── orders (:5003): Postgres orders_service (orders + reservation_id, order_items, notifications)
+   │                   checkout and buy-now: reserve → save (Pending) → queue the job flow
+   │                   /my-orders, /my-notifications; Bull Board at /admin/queues
    └── search (:5004): consumes product_updates → Meilisearch index "products"; no database
+
+BullMQ (Redis), one flow per order:
+  confirm-order (queue orders, orders worker)  ← runs after its child →
+      commit-stock (queue inventory, products worker)
+  reconcile (queue orders, every 30 s): re-queue stuck orders, release orphaned reservations
 ```
 
 Every service has the same layout. `index.js` loads `.env`, connects to the
@@ -71,6 +84,16 @@ Requests flow `routes/` → `controllers/` → `models/`. The models hold plain 
 that runs through `pg`, with the pool in `db/db.js` and the tables in
 `db/schema.sql`. `utils/` holds `ApiError`, `ApiResponse`, `asyncHandler`,
 `circuitBreaker` and similar helpers.
+
+Products and orders also have:
+- `worker.js`: a BullMQ worker, run as its own process.
+- `test/`: tests against `*_service_test` databases, which the tests create.
+
+Two more files hold logic that matters:
+- `services/products/utils/inventoryActions.js`: what the inventory can do in
+  every checkout mode. Shared by the endpoints and the worker.
+- `services/orders/jobs/`: the job processors (`confirmOrder.js`,
+  `reconcile.js`).
 
 The gateway is laid out differently:
 - `index.js` reads the env through `config.js`, which fails fast on bad
@@ -83,26 +106,29 @@ The gateway is laid out differently:
 
 ## Running locally
 
+From the repo root:
+
 ```bash
-docker compose up -d     # postgres (host port 5433), redis, rabbitmq (UI :15672), meilisearch (:7700)
-for d in gateway services/*; do cp -n "$d/.env.example" "$d/.env"; done
-
-# one terminal each for gateway/ and services/{products,cart,orders,search}:
-npm install && npm run dev
-
-cd frontend && npm install && npm run dev       # http://localhost:5173
-
-# seed 1,000 generated products (needs the gateway and products running;
-# search indexes them from the queue)
-cd frontend && node src/utils/addProduct.js
+npm run setup          # once: .env files from .env.example (never overwritten), npm install everywhere
+npm run dev            # containers + 5 services + 2 workers + frontend (:5173), one terminal, Ctrl+C stops all
+npm run dev -- --without=inventory-worker      # leave processes out (e.g. for the worker drill)
+npm run worker:inventory / worker:orders       # start a worker on its own
+npm run seed           # 1,000 generated products (with the stack running)
+npm run sale -- 10     # a flash sale of 10 units; resets its orders, carts and rate limits
+npm run sale:report    # units sold, orders by status, open reservations
+npm test               # all 106 tests (needs the containers)
 ```
 
-To run the flash-sale tests (details in the project 1 spec):
+Under the hood, `scripts/dev.mjs` runs each package's own `npm run dev`
+(nodemon) or `dev:worker` through concurrently.
+
+To run the flash-sale load tests (details in the project 1 spec):
 
 ```bash
-cd services/products && npm run sale:reset -- 10     # prints PRODUCT_ID
+npm run sale -- 10                                   # prints PRODUCT_ID
 k6 run -e BASE_URL=http://localhost:5000 -e PRODUCT_ID=<id> -e USERS=200 loadtest/flash-sale.js
-npm run sale:report                                   # units sold vs stock, open reservations
+npm run sale:report
+cd services/products && npm run sale:drain           # waits until no order is Pending
 ```
 
 To switch modes, set `CHECKOUT_MODE` in `services/products/.env` and restart
@@ -116,16 +142,21 @@ refuses them. `RATE_LIMIT_ALGORITHM=off` reproduces the phase 1 numbers.
 `npm run sale:reset` also clears the rate-limit state. The rate-limit load
 tests are `loadtest/bots-vs-humans.js` and `loadtest/gateway-overhead.js`.
 
-Tests:
+The test suites (`npm test` runs all three) need the containers running:
 
-```bash
-cd gateway && npm test     # 69 tests; needs Redis running, uses (and wipes) Redis database 15
-```
+| Suite | Tests | Uses |
+|---|---|---|
+| gateway | 69 | Redis database 15, wiped by the tests |
+| products | 22 | `product_service_test` and Redis database 14 |
+| orders | 15 | `orders_service_test` |
 
-Start the containers before the services. products crashes if RabbitMQ is
-down, because `connectRabbitMQ()` is neither awaited nor retried. search never
-retries its consumer. Only the gateway has automated tests so far. Frontend
-lint is `npm run lint`.
+They never touch the dev data.
+
+Start the containers before the services; `npm run dev` does that. products
+crashes if RabbitMQ is down, because `connectRabbitMQ()` is neither awaited
+nor retried. search never retries its consumer. Frontend lint is
+`npm run lint`. The `keyword` error in `Header.jsx` predates this work; project
+2 rewrites that search box.
 
 Postgres listens on host port **5433**, so it doesn't clash with another local
 Postgres on 5432. `docker/postgres/init.sql` creates the databases only when
@@ -173,6 +204,25 @@ data included.
   `REDIS_HOST` and `REDIS_PORT`.
 - Never delete `stock:*` keys during a redis-mode sale. They reload from
   Postgres, which doesn't include reservations that haven't committed yet.
+- **Background jobs** (BullMQ 6). Every job must be safe to run twice:
+  workers crash, jobs retry, and a timed-out command can still execute.
+  Ways to get there:
+  - Use deterministic job ids as idempotency keys: `commit-<reservationId>`,
+    `confirm-<orderId>`. BullMQ ids can't contain `:`.
+  - Change state with a conditional UPDATE (`WHERE status = 'Pending'`), not
+    read-check-write.
+  - Make side effects unique (notifications: `UNIQUE (order_id, kind)`).
+- **Job outcomes.** Job processors return outcomes and throw only to retry;
+  use `UnrecoverableError` when retrying can't help. Producers fail fast (no
+  offline queue, 1 s timeout), and the sweeper (`jobs/reconcile.js`) catches
+  whatever couldn't be queued. Workers need `maxRetriesPerRequest: null`.
+- **Changing the flow.** A new step in an order's life needs three things:
+  a case in `reconcile.js` for when it gets stuck, a test in
+  `services/orders/test/jobs.test.js`, and its status in the sale page's
+  `STATUS` map.
+- **Job processors live in `services/orders/jobs/`.** Inventory logic lives in
+  `services/products/utils/inventoryActions.js`, shared by the HTTP endpoints
+  and the worker; keep it the single place where checkout modes differ.
 - Don't add `express.json()` to the gateway. It would consume request bodies
   before the proxy forwards them.
 
@@ -183,9 +233,8 @@ post material.
 
 | Bug | Where | Project |
 |---|---|---|
-| `KEYS products:*` blocks Redis, and `removeAllProducts` runs `flushall`, which would also wipe a running sale's counters, its reservations and every rate limit | `utils/cacheClear.js`, `product.controller.js` | 1 (phase 4) |
-| The products service's Redis client uses ioredis defaults (offline queue, 20 retries), so while Redis is down, requests that touch it hang instead of failing fast. The gateway's `redisClient.js` shows the fix | `services/products/utils/redisClient.js` | 4 |
-| Nothing releases a reservation whose order never committed or released (a crash in between), so its stock stays held | `reservations`, `resv:pending` | 1 (phase 3) |
+| `KEYS products:*` blocks Redis, and `removeAllProducts` runs `flushall`, which would also wipe a running sale's counters, its reservations, every rate limit and the job queues | `utils/cacheClear.js`, `product.controller.js` | 1 (phase 4) |
+| The products service's Redis client uses ioredis defaults (offline queue, 20 retries), so while Redis is down, requests that touch it (the home page's product grid) hang instead of failing fast. The gateway's `redisClient.js` shows the fix | `services/products/utils/redisClient.js` | 1 (phase 4) |
 | The search consumer indexes only name, price, stock, category and description, so search results lack image, colour and gender | `search/utils/messageQueue.js` | 2 |
 | The subcategory filter never applies: the frontend sends `subcategory`, the backend reads `subCategory` | `Categories.jsx`, `product.controller.js` | 2 |
 | Search fires on every keystroke with no debounce or cancel, so stale results can win | `Header.jsx` | 2 |
@@ -198,7 +247,7 @@ post material.
 
 | # | Project | Status | Spec |
 |---|---|---|---|
-| 1 | Flash Sale Mode (Redis) | **active**, phase 3 next | [01-flash-sale.md](docs/projects/01-flash-sale.md) |
+| 1 | Flash Sale Mode (Redis) | **active**, phase 4 next | [01-flash-sale.md](docs/projects/01-flash-sale.md) |
 | 2 | Search 44k real products (Elasticsearch) | pipeline | [pipeline.md](docs/pipeline.md) |
 | 3 | Bulk catalog import (Supabase) | pipeline | [pipeline.md](docs/pipeline.md) |
 | 4 | Go to production (GCP, Cloudflare, Shopify webhooks) | pipeline | [pipeline.md](docs/pipeline.md) |

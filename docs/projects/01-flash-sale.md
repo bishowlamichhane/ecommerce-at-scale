@@ -1,6 +1,7 @@
 # Project 1: Flash Sale Mode (Redis)
 
-- **Status:** active. Phases 0, 1 and 2 are done; phase 3 (async work with BullMQ) is next.
+- **Status:** active. Phases 0 to 3 are done; phase 4 (the read path: cache fixes) is next.
+  To test it all from the browser, follow [docs/try-it.md](../try-it.md).
 - **Branch:** `p1-flash-sale`
 - **Estimate:** about 2 weeks part-time including the move to Postgres (about
   1.5 weeks for the "must" phases)
@@ -30,7 +31,10 @@ at once. Before this project the store failed that test:
 
 The honest arc for the posts: the *minimal* correct fix is one conditional
 `UPDATE` in Postgres. Redis has to earn its place with measured results. So
-far it hasn't, under sustained load (see Results).
+far it hasn't on raw speed, not even with the commit moved to a background
+job (phase 3). What phase 3 did buy is resilience: sales go on with a worker
+down, with Redis down, or after a crash between steps, and every order still
+ends up confirmed or cancelled exactly once (see Results).
 
 ## Design
 
@@ -170,28 +174,81 @@ It runs in the gateway, before anything is proxied. The code is in
 - **Known limit:** the script needs every key on one Redis node. On Redis
   Cluster, the user and IP keys would land in different slots.
 
+### Background jobs (phase 3, done)
+
+**The order's life.** A purchase answers as soon as the order is saved, with
+status `Pending`. A BullMQ **flow** then finishes it, and BullMQ only runs a
+parent job once its child has completed:
+- **child: `commit-stock`**, on the `inventory` queue, run by the products
+  worker. It makes the stock final and returns `committed`, `released` or
+  `unknown`.
+- **parent: `confirm-order`**, on the `orders` queue, run by the orders worker.
+  If the stock is committed, the order becomes `Processing` (confirmed) and
+  the confirmation email is written. Otherwise the order becomes `Cancelled`,
+  with a "sorry" email.
+
+**The emails are simulated:** rows in a `notifications` table, which the sale
+page shows as an inbox.
+
+**What makes it correct:**
+- **Job ids are idempotency keys.** `commit-<reservationId>` and
+  `confirm-<orderId>` make queueing the same flow twice a no-op. Jobs retry
+  with exponential backoff (8 attempts, about 2 minutes in all).
+- **Stock an order is claiming can't be released.** In redis mode, a
+  reservation goes `reserved` → `committing` (claim.lua) → gone. release.lua
+  refuses a `committing` reservation, and a commit that crashed halfway is
+  finished by its retry. In the Postgres modes, both commit and release are
+  conditional UPDATEs on the reservation row, so only one can win.
+- **Each order records its `reservation_id`.** The column is unique, so one
+  reservation can never pay for two orders.
+- **One confirmation per order.** Confirming is a single conditional
+  `UPDATE … WHERE status = 'Pending'`, the same pattern as phase 1, so
+  retries and overlapping runs write one email. An earlier version used a
+  row lock instead; a mutation test showed the tests couldn't catch its
+  removal, which is why this version is simpler.
+- **A failure after the save doesn't lose the order.** If Redis can't take the
+  jobs (it's down or slow), the order still saves and the buyer still gets
+  201. The producers fail fast (no offline queue, a 1 s timeout).
+
+**The safety net: reconcile.** A BullMQ job scheduler runs it every 30 s.
+1. Orders still `Pending` after 60 s: queue their flow, or retry the job that
+   failed, or rebuild a flow whose child vanished.
+2. Reservations still open after 120 s with no order behind them: release them.
+   That's an orders service that crashed between reserving and saving.
+
+All three timings can be set in `services/orders/.env`.
+
+**Workers are their own processes** (`npm run worker:inventory`,
+`npm run worker:orders`). They stop gracefully, finishing the jobs in hand.
+Bull Board runs at http://localhost:5003/admin/queues, and the gateway
+refuses `/orders/admin`.
+
+**The sale page** (`/flash-sale`) shows live stock, Postgres stock and pending
+commits, and lets you buy or act like a bot. It also shows your orders turning
+from Pending to Confirmed, and the inbox. Which product is on sale lives in a
+Postgres `sales` table, so the page keeps working while Redis is down.
+
 ### Still to build
 
-- **BullMQ (phase 3):** `commit-stock`, `send-confirmation` (a simulated email)
-  and a repeatable `release-expired`. The last one sweeps `resv:pending` and
-  `status = 'reserved'` rows older than N minutes; today nothing releases a
-  reservation whose order never committed or released, for example after a
-  crash. Jobs retry with exponential backoff, and Bull Board at `/admin/queues`
-  shows them.
 - **Cache fixes (phase 4):**
   - versioned listing keys instead of `KEYS`
-  - no `flushall`
+  - no `flushall`, which would now also wipe the job queues
   - lock-based stampede protection
   - a product-detail cache
-- **Demo page** `/flash-sale` (phase 5).
+  - fail-fast settings for the products service's Redis client
+- **Demo recording and posts (phase 5).**
 
 ### Dependencies
 
-- Added: `pg` in products, cart and orders (it replaced `mongoose`), and
-  `ioredis` in the gateway (phase 2). Tests use Node's built-in `node:test`,
-  so there's no test framework dependency.
-- Planned: `bullmq`, `@bull-board/api` and `@bull-board/express` in products
-  (phase 3).
+- Added:
+  - `pg` in products, cart and orders (it replaced `mongoose`)
+  - `ioredis` in the gateway (phase 2)
+  - `bullmq` in products and orders (phase 3; BullMQ 6 needs `ioredis` next
+    to it, so orders got that too)
+  - `@bull-board/api` and `@bull-board/express` in orders
+  - `concurrently` at the root, for `npm run dev`
+- Tests use Node's built-in `node:test`, so there's no test framework
+  dependency.
 - k6: the native binary, or the `grafana/k6` Docker image (see Results for why
   native).
 
@@ -244,10 +301,21 @@ It runs in the gateway, before anything is proxied. The code is in
 - [x] Live outage drill: stop Redis mid-traffic, then start it again
 
 ### Phase 3: async work (should)
-- [ ] BullMQ queue and worker for `commit-stock`, `send-confirmation` and `release-expired`
-- [ ] Bull Board for the demo
-- [ ] Kill the worker mid-sale, restart it, and show that nothing is lost
-- [ ] Re-run the sustained test: does redis pull ahead once the commit is off the request path?
+- [x] BullMQ flow per order: `commit-stock` (products worker), then `confirm-order` (orders worker), which also sends the simulated email
+- [x] Reconcile, the safety net (job scheduler, every 30 s): replaces `release-expired`. It also re-queues lost flows and retries failed jobs
+- [x] Redis reservations get a `committing` state; commit and release return outcomes and are safe to repeat or race
+- [x] Bull Board, refused by the gateway
+- [x] Workers as their own processes, with graceful shutdown
+- [x] Tests:
+  - products: 22, covering every checkout mode, races in both directions, and a crash mid-commit
+  - orders: 15, covering confirm/cancel, retries, overlapping runs and every reconcile case
+  - mutation checks: each deliberate bug was caught, after one gap was found and fixed
+- [x] Drills (→ Results):
+  - the inventory worker down mid-sale
+  - Redis frozen, and Redis stopped
+  - a reservation whose order never arrived
+- [x] Re-run the load tests: does redis pull ahead once the commit is off the request path? (No: see Results)
+- [x] Sale page and `npm run dev` (see [try-it.md](../try-it.md))
 
 ### Phase 4: read path (should)
 - [ ] Versioned cache keys; remove `KEYS` and `flushall`
@@ -255,7 +323,7 @@ It runs in the gateway, before anything is proxied. The code is in
 - [ ] k6 read test: p95 and hit ratio (`INFO stats`) with the cache on vs off → Results
 
 ### Phase 5: demo and posts (must)
-- [ ] `/flash-sale` page with live stock
+- [x] `/flash-sale` page with live stock (built in phase 3)
 - [ ] Record the split-screen demo (naive vs redis)
 - [ ] Drafts of post A (design) and post B (demo) in `posts/`
 
@@ -453,6 +521,94 @@ median of 1.10 s.
 6. **A Redis outage doesn't take the store down.** Purchases kept their normal
    speed with Redis stopped, and limiting came back on its own.
 
+### Phase 3: background jobs
+
+**Setup:**
+- Load tests: rate limiter off (as in phase 1), native k6.
+- Drills: the sweeper's timers shortened where noted.
+- "Confirmed after" means how long after the load ended until no order was
+  still Pending (`npm run sale:drain`).
+
+**Tests:** `npm test` at the root runs 106 tests: gateway 69, products 22,
+orders 15.
+- **The products tests** run every checkout mode against real Postgres and
+  Redis (test databases):
+  - commit and release, each repeated
+  - 20 commit-versus-release races per mode, with both outcomes occurring in
+    every mode (commit won 11–16 of 20 in the Postgres modes, 10 of 20 in redis)
+  - a commit that crashed right after claiming its reservation
+- **Mutation checks:** the orders tests caught two deliberate bugs:
+  - the sweeper touching pre-phase-3 orders
+  - cancelling an order whose commit result was missing
+
+  Removing the row lock from the first version of confirmation was *not*
+  caught, because the "overlapping runs" test never really overlapped.
+  Confirmation became a conditional UPDATE, and the test was made truly
+  concurrent: removing that guard now fails 2 tests.
+
+**Drills:**
+
+| Drill | What happened |
+|---|---|
+| Inventory worker down mid-sale (redis mode) | 5 purchases answered 201 in 32–146 ms. Orders stayed Pending, Postgres stock stayed at 10 while Redis showed 5, and 5 commit jobs waited. After the worker started, all 5 were **confirmed within 1.8 s**, Postgres caught up to 5, and 0 reservations were open |
+| Redis frozen (`docker compose pause`), postgres mode | 3 purchases answered 201 in 1.15–1.27 s: the job enqueue gave up after its 1 s timeout. After unpausing, the orders were confirmed **without** the sweeper: the frozen Redis ran the queued commands when it woke up. A timed-out command can still execute; idempotent job ids make that harmless |
+| Redis stopped, postgres mode, sweeper every 3 s, grace 5 s | 3 purchases answered 201 in 31–133 ms (the enqueue failed at once). Orders stayed Pending with 3 reservations open. With Redis back, reconcile logged `flowsQueued: 3`, all 3 were confirmed, and 0 were left open |
+| A reservation whose order never arrived (redis mode, stale after 10 s) | Redis stock went to 8. About 10 s later reconcile released it (`reservationsReleased: 1`), Redis stock went back to 10, and Postgres was untouched |
+
+**Burst with commits in the background:** 200 buyers, 10 units.
+
+| Date | Mode | Orders | Oversold | Median | p95 | Confirmed after |
+|---|---|---|---|---|---|---|
+| 2026-10-04 | postgres | 10 | 0 | 882 ms | 1.02 s | 12 ms |
+| 2026-10-04 | postgres | 10 | 0 | 977 ms | 1.08 s | 8 ms |
+| 2026-10-04 | redis | 10 | 0 | 901 ms | 1.01 s | 8 ms |
+| 2026-10-04 | redis | 10 | 0 | 1.01 s | 1.13 s | 6 ms |
+
+**Sustained with commits in the background:** 200 buyers, 2,000 attempts,
+1,000 units, four interleaved runs per mode.
+
+| Date | Mode | Attempts/s | Median | p95 |
+|---|---|---|---|---|
+| 2026-10-04 | postgres | 176 | 1.15 s | 2.01 s |
+| 2026-10-04 | postgres | 178 | 1.04 s | 1.85 s |
+| 2026-10-04 | postgres | 164 | 1.29 s | 1.61 s |
+| 2026-10-04 | postgres | 171 | 1.06 s | 2.50 s |
+| 2026-10-04 | redis | 190 | 875 ms | 2.02 s |
+| 2026-10-04 | redis | 134 | 1.43 s | 2.14 s |
+| 2026-10-04 | redis | 167 | 1.27 s | 2.51 s |
+| 2026-10-04 | redis | 175 | 1.09 s | 1.95 s |
+
+Every one of those runs sold exactly 1,000 units and left 0 reservations
+open. All 1,000 orders were confirmed by the time the load ended; the drain
+check found none Pending.
+
+**The try-it guide, scripted** the way the browser sends requests:
+- **Buy:** Pending, then Processing 300 ms later.
+- **The bot click right after:** 2 bought, 8 refused, and `Retry-After: 10`
+  readable by the browser.
+- **A new shopper per click, about 1.5 s apart:** 3, 3, 3, 3, 3, 2, 2, 1
+  bought, as the per-IP limit drained.
+- **With the id changing on every request:** 10, then 1–2 per round.
+
+### What the numbers say (phase 3)
+
+1. **Background jobs didn't make checkout faster.** Sustained throughput was
+   164–178/s (postgres) and 134–190/s (redis). Phase 1 managed 197/s and
+   190/s, in one run each. Queueing a flow per order costs a little. The
+   commit was never the bottleneck; the HTTP hops and the order write are.
+2. **They made it resilient.** With the inventory worker down, sales went on
+   at normal speed and every order was confirmed within 1.8 s of the worker's
+   return. With Redis down, purchases went on, and the sweeper confirmed them
+   once Redis was back. A reservation left behind by a "crash" released itself.
+3. **The jobs keep up.** In every load test, all orders were confirmed by the
+   time the load ended.
+4. **A timeout is not a failure.** Commands that timed out against a frozen
+   Redis still ran when it woke up. Idempotent job ids are what make "did it
+   happen or not?" a harmless question.
+5. **Tests need testing too.** A mutation check showed the first overlap test
+   never overlapped. Fixing it also improved the code: a conditional UPDATE
+   instead of a lock.
+
 ## Posts
 
 - **Optional, early:** why the store moved from MongoDB to Postgres before the
@@ -478,3 +634,16 @@ median of 1.10 s.
   - Then the honest twist: rotating identities got the bots back to 60. A
     rate limiter is a seatbelt, not the whole safety system, which leads
     into the waiting room idea.
+- **F, design (phase 3):** "What if the server crashes between taking your
+  order and confirming it?"
+  - The saga in one picture: reserve → save (Pending) → commit-stock →
+    confirm-order, with the sweeper as the safety net.
+  - Job ids as idempotency keys.
+  - `reserved` → `committing`: the state that stops the sweeper from handing
+    back stock an order is claiming.
+- **G, demo (phase 3):** a screen recording of the sale page and Bull Board,
+  side by side.
+  - Stop the inventory worker. Orders pile up as "Confirming…".
+  - Start it. They all confirm within two seconds.
+  - Then the honest twist: background jobs bought resilience, not speed.
+  - Bonus line: "a timeout isn't a failure" (the frozen-Redis drill).
