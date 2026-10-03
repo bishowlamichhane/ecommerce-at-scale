@@ -1,6 +1,6 @@
-import { MeiliSearch } from "meilisearch";
+import { Meilisearch } from "meilisearch";
 
-const client = new MeiliSearch({
+const client = new Meilisearch({
   host: "http://localhost:7700", 
   // masterKey:// optional for development
 });

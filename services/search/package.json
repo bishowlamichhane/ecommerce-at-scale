@@ -17,8 +17,7 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
-    "meilisearch": "^1.16.0",
-    "mongoose": "^8.19.2",
+    "meilisearch": "^0.62.0",
     "nodemon": "^3.1.10",
     "opossum": "^9.0.0"
   }

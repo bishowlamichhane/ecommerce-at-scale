@@ -47,7 +47,7 @@ export async function startRabbitConsumer() {
 
                         const doc = {
                         
-                            id: product._id?.toString() || product.id?.toString(),
+                            id: product.id,
                             name: product.name,
                             price: product.price,
                             stock: product.stock,

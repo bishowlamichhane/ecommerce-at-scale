@@ -19,14 +19,6 @@ services:
       timeout: 3s
       retries: 30
 
-  # Until project 1 phase 0 moves the services to Postgres.
-  mongo:
-    image: mongo:8.0
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo-data:/data/db
-
   redis:
     image: redis:8-alpine
     # AOF on: from project 1, Redis holds live sale stock, not just cache.
@@ -66,7 +58,6 @@ services:
 
 volumes:
   postgres-data:
-  mongo-data:
   redis-data:
   rabbitmq-data:
   meili-data:

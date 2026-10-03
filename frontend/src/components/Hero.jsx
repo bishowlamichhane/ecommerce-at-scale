@@ -65,7 +65,7 @@ const Hero = ({ items, duration, onLoadMore }) => {
     cellStyle.marginBottom = `${GAP / 2}px`; 
     cellStyle.width = columnWidth; 
 
-    const itemId = item?._id || ""; 
+    const itemId = item?.id || "";
     const name = item?.name || 'Unknown Product'; 
     const color = item?.color || 'N/A'; 
     const price = item?.price !== undefined ? item.price : 'N/A'; 

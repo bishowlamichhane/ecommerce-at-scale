@@ -1,4 +1,4 @@
-import { Cart } from "../models/Cart.model.js"
+import { deleteFirstCart, findCart, saveCart } from "../models/Cart.model.js"
 import ApiError from "../utils/ApiError.js"
 import ApiResponse from "../utils/ApiResponse.js"
 import asyncHandler from "../utils/asyncHandler.js"
@@ -31,13 +31,14 @@ const addToCart = asyncHandler(async (req, res) => {
         else if (quantity > product.stock)
             throw new ApiError(404, "Quantity more then stock amount")
 
-        let cart = await Cart.findOne();
+        let cart = await findCart();
         if (!cart) {
-            cart = new Cart({ items: [], totalPrice: 0 })
+            cart = { items: [], totalPrice: 0 }
         }
 
+        // Ids are numbers now, but may arrive as strings: compare as strings.
         const existingItem = cart.items.find(
-            (item) => item.productId.toString() === productId
+            (item) => String(item.productId) === String(productId)
         );
 
         if (existingItem) {
@@ -51,7 +52,7 @@ const addToCart = asyncHandler(async (req, res) => {
 
         else {
             cart.items.push({
-                productId: product._id,
+                productId: product.id,
                 name: product.name,
                 price: product.price,
                 quantity,
@@ -65,7 +66,7 @@ const addToCart = asyncHandler(async (req, res) => {
             return sum + itemTotal;
         }, 0)
 
-        await cart.save()
+        cart = await saveCart(cart)
 
         return res.status(200).json(new ApiResponse(200, "Item added to cart", cart))
 
@@ -83,7 +84,7 @@ const getCartItems = asyncHandler(async (req, res) => {
 
     try {
 
-        const cart = await Cart.findOne();
+        const cart = await findCart();
         console.log(cart)
 
         if (!cart) {
@@ -109,9 +110,9 @@ const getCartItems = asyncHandler(async (req, res) => {
         );
 
         const products = productResponses.map((res, i) => {
-            const { name, price, _id, image } = res.message;
+            const { name, price, id, image } = res.message;
             return {
-                name, image, price, _id, quantity: cart.items[i].quantity
+                name, image, price, id, quantity: cart.items[i].quantity
             }
         });
 
@@ -137,14 +138,14 @@ const removeFromCart = asyncHandler(async (req, res) => {
 
     try {
 
-        let cart = await Cart.findOne();
+        let cart = await findCart();
 
         if (!cart || !cart.items.length) {
             throw new ApiError(404, "No items in cart")
         }
 
         const existingItem = cart.items.find(
-            (p) => p.productId?.toString() === productId
+            (p) => String(p.productId) === String(productId)
         )
         if (!existingItem)
             throw new ApiError(404, "Item not found in cart")
@@ -154,7 +155,7 @@ const removeFromCart = asyncHandler(async (req, res) => {
                 existingItem.quantity -= quantity;
             }
             else if (existingItem.quantity == quantity) {
-                cart.items = cart.items.filter((p) => p.productId.toString() !== productId);
+                cart.items = cart.items.filter((p) => String(p.productId) !== String(productId));
             }
             else {
                 throw new ApiError(400, `Cart only has ${existingItem.quantity} items.`)
@@ -166,7 +167,7 @@ const removeFromCart = asyncHandler(async (req, res) => {
             return sum + itemTotal
         }, 0);
         cart.totalPrice = totalPrice;
-        await cart.save();
+        cart = await saveCart(cart);
         return res.status(200).json(new ApiResponse(200, "Items removed", { cart }))
 
     }
@@ -179,7 +180,7 @@ const removeFromCart = asyncHandler(async (req, res) => {
 const clearCart = asyncHandler(async (req, res) => {
 
     try {
-        const cart = await Cart.findOneAndDelete();
+        const cart = await deleteFirstCart();
 
         return res.status(200).json(new ApiResponse(200, "Cart cleared successfully", cart))
 

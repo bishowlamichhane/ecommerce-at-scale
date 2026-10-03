@@ -1,7 +1,7 @@
 import axios from "axios";
 import asyncHandler from "../utils/asyncHandler.js";
 import ApiError from "../utils/ApiError.js";
-import { Order } from "../models/Order.model.js";
+import { createOrder, findOrderById } from "../models/Order.model.js";
 import ApiResponse from "../utils/ApiResponse.js";
 import breaker from "../utils/circuitBreaker.js";
 
@@ -21,7 +21,7 @@ const placeOrder = asyncHandler(async (req, res) => {
 
 
         for (const item of cart.products) {
-            const productRes = await axios.get(`${process.env.PRODUCT_SERVICE_URL}/get-product-by-id/${item._id}`);
+            const productRes = await axios.get(`${process.env.PRODUCT_SERVICE_URL}/get-product-by-id/${item.id}`);
             console.log("product-Retrieved", productRes)
             const product = productRes.data.message
 
@@ -31,12 +31,12 @@ const placeOrder = asyncHandler(async (req, res) => {
 
             await axios.patch(`${process.env.PRODUCT_SERVICE_URL}/update-product`,
                 {
-                    productId: product._id, stock: product.stock - item.quantity
+                    productId: product.id, stock: product.stock - item.quantity
                 })
         }
 
 
-        const order = await Order.create({
+        const order = await createOrder({
             userId,
             items: cart.products,
             totalPrice: cart.totalPrice,
@@ -73,7 +73,7 @@ const checkStatusById = asyncHandler(async (req, res) => {
 
     try {
 
-        const order = await Order.findById(orderId);
+        const order = await findOrderById(orderId);
         if (!order)
             throw new ApiError(400, "Order not found");
 

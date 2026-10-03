@@ -71,7 +71,7 @@ const Cart = () => {
                         <div className='w-20 h-full'> <img src={item?.image} className='w-full h-full object-cover' /></div>
                         <div className='flex w-90 px-10 border-r border-white flex-col gap-2'><p>{item?.name}</p><p>{item?.price}</p></div>
                         <div className='flex items-center justify-center flex-1 '><span>x</span><p>{item?.quantity}</p></div>
-                        <button className='absolute top-0 right-0 bg-red-500 text-white px-4 py-2' onClick={() => removeFromCart(item._id, item.quantity)}>Remove</button>
+                        <button className='absolute top-0 right-0 bg-red-500 text-white px-4 py-2' onClick={() => removeFromCart(item.id, item.quantity)}>Remove</button>
                     </div>
                 ))}
 

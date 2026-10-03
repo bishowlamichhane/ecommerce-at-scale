@@ -19,7 +19,7 @@ const Header = ({ setSearchItems, setSearchResponse, setSearchIds }) => {
       const endTime = performance.now();
       setSearchResponse((endTime - startTime).toFixed(2));
 
-      setSearchIds(data.message.map(p => p._id));
+      setSearchIds(data.message.map(p => p.id));
 
       setSearchItems(data.message);
       console.log(data.message)
