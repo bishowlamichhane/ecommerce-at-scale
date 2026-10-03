@@ -1,4 +1,12 @@
-import { Product } from "../models/Product.model.js";
+import {
+  createProduct,
+  deleteAllProducts,
+  deleteProductById,
+  filterProducts as findFilteredProducts,
+  findProductById,
+  findProducts,
+  updateProductImage,
+} from "../models/Product.model.js";
 import ApiError from "../utils/ApiError.js";
 import ApiResponse from "../utils/ApiResponse.js";
 import asyncHandler from "../utils/asyncHandler.js";
@@ -6,7 +14,6 @@ import breaker from "../utils/circuitBreaker.js";
 import { publishProductEvent } from "../utils/messageQueue.js";
 import redis from "../utils/redisClient.js";
 import { clearProductCache } from "../utils/cacheClear.js";
-import mongoose from "mongoose";
 
 const getProducts = asyncHandler(async (req, res) => {
 
@@ -54,8 +61,8 @@ const getProducts = asyncHandler(async (req, res) => {
 
     console.log("🐢 Redis cache MISS");
 
-    // 2️⃣ If not cached, fetch from MongoDB
-    const products = await Product.find().skip(skip).limit(limit);
+    // 2️⃣ If not cached, fetch from Postgres
+    const products = await findProducts({ skip, limit });
 
     if (!products) throw new ApiError(400, "Failed to retrieve products");
 
@@ -94,7 +101,7 @@ const addProduct = asyncHandler(async (req, res) => {
     if (!name || !price)
       throw new ApiError(400, "Name, price, and stock are required")
 
-    const product = await Product.create({
+    const product = await createProduct({
       name,
       price,
       stock,
@@ -109,7 +116,7 @@ const addProduct = asyncHandler(async (req, res) => {
 
 
 
-    publishProductEvent({ action: "add", product: product.toObject() });
+    publishProductEvent({ action: "add", product });
 
 
     await clearProductCache();
@@ -145,7 +152,7 @@ const getProductById = asyncHandler(async (req, res) => {
     if (!id)
       throw new ApiError(400, "Product ID is required");
 
-    const product = await Product.findById(id)
+    const product = await findProductById(id)
 
     if (!product)
       throw new ApiError(404, "Product not found");
@@ -166,7 +173,7 @@ const removeProduct = asyncHandler(async (req, res) => {
     if (!id)
       throw new ApiError(400, "Product id is required")
 
-    const productToDelete = await Product.findByIdAndDelete(id);
+    const productToDelete = await deleteProductById(id);
 
     if (!productToDelete)
       throw new ApiError(404, "Product not found")
@@ -190,12 +197,11 @@ const updateProduct = asyncHandler(async (req, res) => {
 
     const { productId, image } = req.body
 
-    const product = await Product.findByIdAndUpdate(productId, { $set: { image } },
-      { new: true, runValidators: true })
+    const product = await updateProductImage(productId, image)
     if (!product) {
       throw new ApiError(404, "Product not found");
     }
-    publishProductEvent({ action: "update", product: product.toObject() });
+    publishProductEvent({ action: "update", product });
 
     await clearProductCache();
 
@@ -211,7 +217,7 @@ const updateProduct = asyncHandler(async (req, res) => {
 
 const removeAllProducts = asyncHandler(async (req, res) => {
   try {
-    const result = await Product.deleteMany({});
+    const deletedCount = await deleteAllProducts();
 
     publishProductEvent({ action: "delete_all" });
 
@@ -222,7 +228,7 @@ const removeAllProducts = asyncHandler(async (req, res) => {
       .json(
         new ApiResponse(
           200,
-          `All products deleted successfully (${result.deletedCount} items removed)`
+          `All products deleted successfully (${deletedCount} items removed)`
         )
       );
   } catch (error) {
@@ -253,44 +259,33 @@ const filterProducts = asyncHandler(async (req, res) => {
 
 
 
-    const filters = {};
     let idList = [];
     // 1️ Restrict to search result IDs
     if (ids) {
       idList = Array.isArray(ids) ? ids : ids.split(",");
     }
+    idList = idList.map(id => String(id).trim());
     console.log("Parsed ID List:", idList);
-
-
-    if (idList.length > 0) {
-      filters._id = {
-        $in: idList.map(id => new mongoose.Types.ObjectId(id.trim()))
-      };
-    }
 
     const parseValues = value => {
       if (!value) return [];
       return Array.isArray(value) ? value : value.split(",").map(v => v.trim());
     };
 
-
-
-
-    // 2️ Apply all other filters normally
-    if (category) filters.category = { $in: parseValues(category) };
-    if (gender) filters.gender = { $in: parseValues(gender) };
-    if (color) filters.color = { $in: parseValues(color) };
-    if (usage) filters.usage = { $in: parseValues(usage) };
-    if (subCategory) filters.subCategory = { $in: parseValues(subCategory) };
-
-    if (priceMin || priceMax) {
-      filters.price = {};
-      if (priceMin) filters.price.$gte = Number(priceMin);
-      if (priceMax) filters.price.$lte = Number(priceMax);
-    }
-
-    // 3️ Query MongoDB with filters
-    const result = await Product.find(filters).limit(1000);
+    // 2️ Apply all other filters normally.
+    // Still reads `subCategory` while the frontend sends `subcategory`, so the
+    // subcategory filter stays off until project 2 fixes it.
+    // 3️ Query Postgres with filters
+    const result = await findFilteredProducts({
+      ids: idList,
+      category: parseValues(category),
+      gender: parseValues(gender),
+      color: parseValues(color),
+      usage: parseValues(usage),
+      subcategory: parseValues(subCategory),
+      priceMin,
+      priceMax,
+    });
     console.log(result)
     return res.status(200).json(
       new ApiResponse(200, "Filtered products retrieved successfully", result)

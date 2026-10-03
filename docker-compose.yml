@@ -35,6 +35,11 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   rabbitmq:
     image: rabbitmq:4.3-management
@@ -43,6 +48,12 @@ services:
       - "15672:15672" # management UI: http://localhost:15672 (guest / guest)
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      # products crashes if RabbitMQ isn't accepting connections yet
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
 
   meilisearch:
     image: getmeili/meilisearch:v1.54

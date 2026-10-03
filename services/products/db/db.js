@@ -1,27 +1,33 @@
-import mongoose from "mongoose";
-import { dbName } from "../constants.js";
+import pg from "pg";
+import { readFile } from "node:fs/promises";
+
+// node-postgres returns NUMERIC as a string so no precision is lost.
+// Prices fit comfortably in a JS number, so parse them once, here.
+pg.types.setTypeParser(pg.types.builtins.NUMERIC, (value) => parseFloat(value));
+
+// Created in connectDB(), after .env has been loaded.
+let pool;
+
+export const query = (text, params) => pool.query(text, params);
 
 const connectDB = async () => {
   try {
-    const connectionInstance = await mongoose.connect(
-      `${process.env.MONGODB_URI}`,
-      {
-        useNewUrlParser: true,
-        useUnifiedTopology: true,
-      }
-    );
+    pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 
-    console.log(`✅ MongoDB connected: ${connectionInstance.connection.host}`);
+    const schema = await readFile(new URL("./schema.sql", import.meta.url), "utf8");
+    await pool.query(schema);
 
- 
+    const { rows } = await pool.query("SELECT current_database() AS db");
+    console.log(`✅ Postgres connected: ${rows[0].db}`);
+
     process.on("SIGINT", async () => {
-      await mongoose.connection.close();
-      console.log("🔒 MongoDB connection closed due to app termination");
+      await pool.end();
+      console.log("🔒 Postgres pool closed due to app termination");
       process.exit(0);
     });
 
   } catch (error) {
-    console.error("❌ MongoDB connection error:", error.message);
+    console.error("❌ Postgres connection error:", error.message);
     process.exit(1);
   }
 };
