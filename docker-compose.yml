@@ -3,6 +3,10 @@
 services:
   postgres:
     image: postgres:17-alpine
+    # pg_stat_statements counts every statement Postgres runs. The load tests
+    # read it to see how many queries really reached the database, instead of
+    # trusting the app's own account.
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
     environment:
       POSTGRES_USER: store
       POSTGRES_PASSWORD: store # local-only default

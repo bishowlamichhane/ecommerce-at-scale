@@ -12,66 +12,44 @@ import ApiResponse from "../utils/ApiResponse.js";
 import asyncHandler from "../utils/asyncHandler.js";
 import breaker from "../utils/circuitBreaker.js";
 import { publishProductEvent } from "../utils/messageQueue.js";
-import redis from "../utils/redisClient.js";
-import { clearProductCache } from "../utils/cacheClear.js";
+import { cacheStatusHeader } from "../utils/cache.js";
+import { catalogCache, ITEM_TTL_SECONDS, itemKey, LIST_TTL_SECONDS, listKey } from "../utils/catalogCache.js";
 
+// Reads through the catalog cache when the request is cacheable, otherwise
+// straight from Postgres, and tells the client which it was (Cache-Status).
+async function readCatalog(res, { cacheable, key, load, ttlSeconds }) {
+  if (!cacheable) {
+    // Set before reading, so a request Postgres rejects still says why it
+    // skipped the cache.
+    const status = { fwd: "bypass", detail: "not-cacheable" };
+    res.set("Cache-Status", cacheStatusHeader("catalog", status));
+    return { value: await load(), status };
+  }
+  const { value, status } = await catalogCache().read(key, load, { ttlSeconds });
+  res.set("Cache-Status", cacheStatusHeader("catalog", status));
+  return { value, status };
+}
+
+// A page of the product list. Only ordinary pages are cached: a request
+// without limit/skip (which returns every product, as search's /sync asks)
+// or with a huge one goes straight to Postgres, so nobody can fill Redis with
+// one-off pages.
 const getProducts = asyncHandler(async (req, res) => {
-
-  // try {
-  //         const cached = cache.get("products");
-  //         if(cached){
-  //             console.log(cached)
-  //             return res.status(200).json(new ApiResponse(200,"Products retrieved successfully from cache",cached));
-  //         }
-  //     const limit  = parseInt(req.query.limit) || 1000;
-  //     const products = await index.search("", { limit: 1000 });;
-
-  //     cache.set("products",products.hits);
-
-  //     if(products.hits.length === 0)
-  //         return res.status(200).json(new ApiResponse(200,"No products found",products.hits));
-
-  //     else if(!products.hits)
-  //         throw new ApiError(400,"Products failed to retrieve");
-
-  //     return res.status(200).json(new ApiResponse(200,"Products retrieved successfully",products.hits));
-  // } catch (error) {
-  //     throw new ApiError(400,error?.message || "Failed to retrieve product")
-
-  // }
-
   try {
     const limit = parseInt(req.query.limit)
     const skip = parseInt(req.query.skip)
+    const cacheable = Number.isInteger(limit) && Number.isInteger(skip)
+      && limit >= 1 && limit <= 100 && skip >= 0 && skip <= 10_000;
 
-    const cacheKey = `products:${skip}:${limit}`;
+    const { value: products, status } = await readCatalog(res, {
+      cacheable,
+      key: listKey(skip, limit),
+      load: () => findProducts({ skip, limit }),
+      ttlSeconds: LIST_TTL_SECONDS,
+    });
 
-    // 1️⃣ Try Redis first
-    const cachedData = await redis.get(cacheKey);
-    if (cachedData) {
-      console.log("⚡ Redis cache hit");
-      return res.status(200).json(
-        new ApiResponse(
-          200,
-          "Products retrieved successfully from Redis cache",
-          JSON.parse(cachedData)
-        )
-      );
-    }
-
-    console.log("🐢 Redis cache MISS");
-
-    // 2️⃣ If not cached, fetch from Postgres
-    const products = await findProducts({ skip, limit });
-
-    if (!products) throw new ApiError(400, "Failed to retrieve products");
-
-    // 3️⃣ Store in Redis for future requests (TTL 60 sec)
-    await redis.set(cacheKey, JSON.stringify(products), "EX", 60);
-
-    return res.status(200).json(
-      new ApiResponse(200, "Products retrieved successfully", products)
-    );
+    const message = status.hit ? "Products retrieved successfully from Redis cache" : "Products retrieved successfully";
+    return res.status(200).json(new ApiResponse(200, message, products));
   } catch (error) {
     throw new ApiError(
       error.statusCode || 400,
@@ -116,10 +94,9 @@ const addProduct = asyncHandler(async (req, res) => {
 
 
 
+    // Invalidate first: it never throws, while publishing can (RabbitMQ down).
+    await catalogCache().invalidate();
     publishProductEvent({ action: "add", product });
-
-
-    await clearProductCache();
 
 
 
@@ -152,7 +129,21 @@ const getProductById = asyncHandler(async (req, res) => {
     if (!id)
       throw new ApiError(400, "Product ID is required");
 
-    const product = await findProductById(id)
+    // Only plain digits within Postgres' integer range are cached, under the
+    // canonical id, so /7 and /007 share one entry. Anything else goes to
+    // Postgres untouched and gets the answer it always got: Number() would
+    // read "1e3" as 1000, where Postgres rejects it.
+    // "Not found" is cached as well (negative caching), so random ids can't
+    // hammer the database; a product created later bumps the cache version,
+    // so it still shows up at once.
+    const numericId = /^\d{1,10}$/.test(id) ? Number(id) : NaN
+    const cacheable = numericId >= 1 && numericId <= 2_147_483_647
+    const { value: product } = await readCatalog(res, {
+      cacheable,
+      key: itemKey(numericId),
+      load: () => findProductById(cacheable ? numericId : id),
+      ttlSeconds: ITEM_TTL_SECONDS,
+    })
 
     if (!product)
       throw new ApiError(404, "Product not found");
@@ -179,10 +170,8 @@ const removeProduct = asyncHandler(async (req, res) => {
       throw new ApiError(404, "Product not found")
 
 
+    await catalogCache().invalidate();
     publishProductEvent({ action: "delete", productId: id });
-
-
-    await clearProductCache();
 
     res.status(200).json(new ApiResponse(200, "Product deleted successfully"));
 
@@ -201,9 +190,8 @@ const updateProduct = asyncHandler(async (req, res) => {
     if (!product) {
       throw new ApiError(404, "Product not found");
     }
+    await catalogCache().invalidate();
     publishProductEvent({ action: "update", product });
-
-    await clearProductCache();
 
     return res.json(new ApiResponse(200, "Product updated successfully", product)).status(200)
 
@@ -219,10 +207,11 @@ const removeAllProducts = asyncHandler(async (req, res) => {
   try {
     const deletedCount = await deleteAllProducts();
 
+    // This used to be `flushall`, which also wiped the rate limits, a running
+    // sale's stock counters and reservations, and the job queues. Only the
+    // catalog cache needs to go, and bumping its version does that in O(1).
+    await catalogCache().invalidate();
     publishProductEvent({ action: "delete_all" });
-
-
-    await redis.flushall();
     return res
       .status(200)
       .json(

@@ -27,8 +27,9 @@ const UNTRACKED = "untracked"; // stored instead of a number when stock is NULL
 // never overwrites a live counter, so two requests loading the same product
 // at once can't undo each other's reservations.
 //
-// Caveat: if a counter is deleted mid-sale (the old `flushall`!), it reloads
-// from Postgres, which doesn't include reservations that haven't committed yet.
+// Caveat: if a counter is deleted mid-sale, it reloads from Postgres, which
+// doesn't include reservations that haven't committed yet. Before phase 4,
+// "delete all products" ran `flushall` and could cause exactly that.
 async function ensureLoaded(items) {
   const current = await redis.mget(items.map((item) => stockKey(item.productId)));
   const missing = items.filter((_, i) => current[i] === null).map((item) => item.productId);

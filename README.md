@@ -18,6 +18,7 @@ sneakers at once?
 | 1 | 200 buyers for 10 pairs: the store sold 119 | Atomic stock reservations in four switchable modes: read-check-write, one conditional `UPDATE`, `SELECT … FOR UPDATE`, and a Redis Lua script | Read-check-write oversold by 81–109 units. Every correct mode sold exactly 10, every run |
 | 2 | Bots took 84–88 of 100 units | A GCRA rate limiter in the gateway: per shopper and per IP, checked atomically in Lua, with IETF RateLimit headers. It keeps serving if Redis goes down | Bots got 15 of 100. Under a bot flood, humans' median wait fell from 323–338 ms to 73–74 ms. Cost: about 1.4 ms per request |
 | 3 | A crash between "order saved" and "stock committed" | BullMQ job flows that are safe to retry, and a sweeper that repairs lost work | With the inventory worker down mid-sale, every order was confirmed within 1.8 s of its return. With Redis down, the sweeper recovered every order |
+| 4 | A cold home page sends every shopper to Postgres at once, and clearing the cache wiped all of Redis, sale included | A versioned Redis cache with stampede protection that fails open, and RFC 9211 `Cache-Status` headers | 150 shoppers on a cold page: 150 Postgres queries became 1. Steady browsing: 97.9% hits, 98% fewer queries. With Redis down, the home page still answers in milliseconds |
 
 Every number comes from runs recorded in
 [the project 1 spec](docs/projects/01-flash-sale.md), including the ones

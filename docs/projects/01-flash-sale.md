@@ -1,6 +1,6 @@
 # Project 1: Flash Sale Mode (Redis)
 
-- **Status:** active. Phases 0 to 3 are done; phase 4 (the read path: cache fixes) is next.
+- **Status:** active. Phases 0 to 4 are done; phase 5 (the demo recording and posts) is next.
   To test it all from the browser, follow [docs/try-it.md](../try-it.md).
 - **Branch:** `p1-flash-sale`
 - **Estimate:** about 2 weeks part-time including the move to Postgres (about
@@ -27,7 +27,8 @@ at once. Before this project the store failed that test:
    bought 84–88 of 100 units. *(Fixed in phase 2: 15 of 100.)*
 5. **Cache invalidation blocks Redis** (`KEYS products:*`). `removeAllProducts`
    also runs `flushall`, which would now also wipe the sale's stock counters
-   and reservations. *(Phase 4.)*
+   and reservations. *(Fixed in phase 4: one `INCR` makes every cached entry
+   outdated, and nothing else in Redis is touched.)*
 
 The honest arc for the posts: the *minimal* correct fix is one conditional
 `UPDATE` in Postgres. Redis has to earn its place with measured results. So
@@ -228,14 +229,55 @@ commits, and lets you buy or act like a bot. It also shows your orders turning
 from Pending to Confirmed, and the inbox. Which product is on sale lives in a
 Postgres `sales` table, so the page keeps working while Redis is down.
 
+### The read path (phase 4, done)
+
+The catalog cache (`services/products/utils/cache.js`) is cache-aside in
+Redis. It holds pages of the product list (60 s) and single products (30 s).
+
+- **Invalidation without scanning.** Each entry stores the catalog version it
+  was read under, and a read only accepts an entry whose version is current.
+  A write runs one `INCR catalog:version`: O(1), however much is cached. This
+  replaced `KEYS products:*`, which blocks Redis while it scans, and
+  `flushall`, which also wiped the sale's counters, reservations, rate limits
+  and job queues.
+- **No stale sets.** A slow read that overlaps a write stores what it read
+  under the old version, so no later read accepts it.
+- **Stampede protection.** When an entry is missing, one request reads
+  Postgres and the others wait for its result:
+  - within a process, through a shared promise
+  - across processes, through a short Redis lock (`SET NX PX`, released by a
+    compare-and-delete script)
+
+  It's the idea behind the leases in Facebook's memcache paper (NSDI 2013).
+  Waiting is bounded at 1 s, so a lock holder that dies costs a wait, not an
+  outage.
+- **Negative caching.** "Not found" is cached too, so random ids can't hammer
+  Postgres. A product created later still shows at once, because its write
+  bumps the version.
+- **Only what's worth caching.** List pages with a limit of 1–100 and a skip
+  of 0–10,000, and ids that are plain digits within Postgres' integer range.
+  Anything else goes to Postgres untouched, including search's `/sync`, which
+  asks for every product.
+- **Fail open, fail fast.** If Redis is down, reads go straight to Postgres.
+  - The cache's Redis client gives up after 100 ms and has no offline queue.
+  - After a failure, Redis is skipped for 1 s, so a frozen Redis costs one
+    timeout a second, not one per request.
+  - An invalidation that fails is retried before this process serves
+    anything cached again.
+- **Observable.** Every response says what the cache did, in a
+  `Cache-Status` header (RFC 9211):
+  - `catalog; hit; ttl=42`
+  - `catalog; fwd=uri-miss; stored`
+  - `catalog; fwd=uri-miss; collapsed` (waited for another request's read)
+  - `catalog; fwd=bypass; detail=redis-unavailable`
+- **The trade-off.** Stock in a cached product can be up to 30 s old. The
+  reservation is the real stock check; the cart's "more than in stock" check
+  is only advisory.
+- **Measurable.** `CACHE_MODE` switches between `off`, `plain` (versioned, no
+  stampede protection) and `protected`.
+
 ### Still to build
 
-- **Cache fixes (phase 4):**
-  - versioned listing keys instead of `KEYS`
-  - no `flushall`, which would now also wipe the job queues
-  - lock-based stampede protection
-  - a product-detail cache
-  - fail-fast settings for the products service's Redis client
 - **Demo recording and posts (phase 5).**
 
 ### Dependencies
@@ -318,9 +360,12 @@ Postgres `sales` table, so the page keeps working while Redis is down.
 - [x] Sale page and `npm run dev` (see [try-it.md](../try-it.md))
 
 ### Phase 4: read path (should)
-- [ ] Versioned cache keys; remove `KEYS` and `flushall`
-- [ ] Stampede protection and the product-detail cache
-- [ ] k6 read test: p95 and hit ratio (`INFO stats`) with the cache on vs off → Results
+- [x] Versioned cache keys; remove `KEYS` and `flushall`
+- [x] Stampede protection and the product-detail cache
+- [x] Fail-fast Redis client in products: the home page loads with Redis down
+- [x] k6 read test (`loadtest/catalog-read.js`) with the cache off, plain and
+  protected: latency, hit ratio (from `Cache-Status`) and the queries that
+  reached Postgres (`pg_stat_statements`) → Results
 
 ### Phase 5: demo and posts (must)
 - [x] `/flash-sale` page with live stock (built in phase 3)
@@ -608,6 +653,76 @@ check found none Pending.
 5. **Tests need testing too.** A mutation check showed the first overlap test
    never overlapped. Fixing it also improved the code: a conditional UPDATE
    instead of a lock.
+
+### Phase 4: the read path
+
+Setup:
+- Requests went straight to the products service (`:5001`): 1,001
+  products, one products process, native k6 on a Windows laptop.
+- The script is `loadtest/catalog-read.js`, and `CACHE_MODE` picked the mode.
+- Before each run, `INCR catalog:version` made every cached entry outdated.
+- Postgres' query counts come from `pg_stat_statements`. In every run they
+  matched the `Cache-Status` counts exactly.
+
+**Cold burst: 150 shoppers open the home page at once, right after the
+catalog changed** (three runs per mode)
+
+| Mode | Queries that reached Postgres | What `Cache-Status` said | Median | p95 |
+|---|---|---|---|---|
+| off | 150, 150, 150 | 150 bypass | 131–153 ms | 198–232 ms |
+| plain (versioned, no stampede protection) | 80, 70, 92 | 70–92 misses, the rest hits | 110–155 ms | 186–258 ms |
+| protected | 1, 1, 1 | 1 miss, 100–118 collapsed, 31–49 hits | 92–121 ms | 128–153 ms |
+
+**Steady browsing: 400 requests a second for 20 s** (one run per mode)
+
+8,000 requests: two thirds were list pages, with each "load more" half as
+likely as the one before, and one third were single products.
+
+| Mode | Hit ratio | Postgres queries | List median / p95 | Product median / p95 |
+|---|---|---|---|---|
+| off | 0% | 8,000 | 2.86 / 4.83 ms | 2.52 / 4.20 ms |
+| plain | 97.9% | 167 | 1.71 / 3.13 ms | 1.57 / 4.05 ms |
+| protected | 97.9% | 159 | 2.01 / 3.43 ms | 1.67 / 5.15 ms |
+
+No request failed in any run.
+
+**Redis drills** (protected mode, single home-page requests)
+
+- **Redis stopped:** every request was answered from Postgres in 5.5–13 ms,
+  marked `fwd=bypass; detail=redis-unavailable`. The old client queued
+  commands while Redis was down, so the grid hung; that wasn't timed.
+- **Redis frozen** (`docker pause`):
+  - The first request waited out the 100 ms timeout: 110 ms.
+  - The next three took 5.9–7.5 ms, with Redis skipped.
+  - 1.2 s later, one request tried Redis again (119 ms), and the one after
+    it took 6.4 ms.
+- **Through the gateway, a frozen Redis still cost each request 113–117
+  ms.** The rate limiter waits out its own 100 ms Redis timeout on every
+  request. Giving it the same skip-for-a-second is a follow-up.
+- **Redis back:** hits again straight away.
+
+**Mutation check:** I broke the cache on purpose in 33 different ways, and
+the tests caught every one.
+
+### What the numbers say (phase 4)
+
+1. **Stampede protection is what turns a cache into a shield.** A cold burst
+   of 150 sent Postgres 150 queries with no cache, 70–92 with a plain cache,
+   and exactly 1 with protection. A plain cache only helps once the first
+   reader has finished.
+2. **In steady traffic, the win is load, not speed.** Postgres ran 98% fewer
+   queries (8,000 → 159–167). Latency barely moved: these are 1–3 ms index
+   lookups on a 1,001-row table over localhost, so there's little to save.
+3. **What protection costs in steady traffic isn't settled.** Plain and
+   protected got the same hit ratio. Protected's tail was a little higher in
+   its one run (product p95 5.15 vs 4.05 ms, max 86–93 vs 17–18 ms). One run
+   each can't tell noise from cost.
+4. **Failing open only helps if it also fails fast.** With Redis stopped or
+   frozen, the home page kept answering in milliseconds. A frozen Redis cost
+   one 100 ms wait a second, not one per request.
+5. **The header tells the truth.** `Cache-Status` matched
+   `pg_stat_statements` in every run, so it can be trusted when debugging
+   from the browser.
 
 ## Posts
 

@@ -135,8 +135,8 @@ Nothing was lost: the jobs waited in Redis until a worker came back.
 
    While Redis is down, also expect:
    - Redis connection errors from the workers in the log.
-   - The home page's product grid hangs. That's a known issue, fixed in
-     project 4.
+   - The home page still loads, straight from Postgres. (Before phase 4, its
+     product grid hung.)
 3. Bring Redis back:
 
    ```bash
@@ -151,7 +151,30 @@ Nothing was lost: the jobs waited in Redis until a worker came back.
 For a 5-second version, set `PENDING_GRACE_MS=5000` and
 `RECONCILE_EVERY_MS=3000` in `services/orders/.env` and restart.
 
-## 7. Switch checkout to Redis (optional)
+## 7. Watch the cache
+
+1. Open the home page with the browser's developer tools on the **Network**
+   tab, and click the `get-products?limit=20&skip=0` request. Its response
+   headers include `Cache-Status`:
+   - `catalog; fwd=uri-miss; stored`: this request read Postgres and cached
+     the page.
+   - Reload, and it's `catalog; hit; ttl=57`: answered from Redis, still
+     fresh for 57 seconds.
+2. Run `npm run sale -- 10` and reload. It's `fwd=uri-miss; stored` again: a
+   change to the catalog makes every cached page outdated at once, with one
+   Redis command (`INCR catalog:version`), however much is cached.
+3. To see what's cached:
+
+   ```bash
+   docker compose exec redis redis-cli --scan --pattern 'catalog:*'
+   ```
+
+4. Stop Redis (step 6) and reload: `catalog; fwd=bypass;
+   detail=redis-unavailable`. The page comes straight from Postgres.
+
+To measure the cache instead, see `loadtest/catalog-read.js`.
+
+## 8. Switch checkout to Redis (optional)
 
 1. In `services/products/.env`, set `CHECKOUT_MODE=redis`.
 2. Restart `npm run dev`, then run `npm run sale -- 10`. The badge reads

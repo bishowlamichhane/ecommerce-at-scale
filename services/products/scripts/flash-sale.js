@@ -89,7 +89,8 @@ async function reset(stock) {
 
   await redis.del(`stock:${id}`);
   await deleteKeys("resv:*");
-  await deleteKeys("products:*");
+  // Stock changed behind the API's back: make every cached catalog entry outdated.
+  await redis.incr("catalog:version");
   // The gateway's rate-limit state: every run starts with full buckets, so the
   // previous run's bots can't affect this one.
   await deleteKeys("rl:*");

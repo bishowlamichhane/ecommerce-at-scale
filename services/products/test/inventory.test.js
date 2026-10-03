@@ -2,7 +2,7 @@ import "./env.js";
 import { after, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import connectDB, { closeDB, query } from "../db/db.js";
-import redis from "../utils/redisClient.js";
+import redis, { cacheRedis, waitForRedis } from "../utils/redisClient.js";
 import { ensureTestDatabase, uid } from "./helpers.js";
 import {
   commitReservation,
@@ -23,11 +23,14 @@ let productId;
 before(async () => {
   await ensureTestDatabase();
   await connectDB({ handleSignals: false });
+  // The clients don't queue commands while connecting, so wait for them.
+  assert.ok(await waitForRedis(redis), "Redis isn't reachable: docker compose up -d redis");
 });
 
 after(async () => {
   await closeDB();
   redis.disconnect();
+  cacheRedis.disconnect();
 });
 
 beforeEach(async () => {

@@ -8,8 +8,9 @@ ships or the architecture changes, update this file in the same change.
 - phase 1: atomic stock reservations
 - phase 2: GCRA rate limiting in the gateway
 - phase 3: background jobs with BullMQ, a self-healing sweeper and the sale page
+- phase 4: the read path, a versioned catalog cache with stampede protection
 
-Phase 4, the read path (cache fixes), is next. The spec, checklist and every
+Phase 5, the demo recording and the posts, is next; Bishow is doing it. The spec, checklist and every
 measured result are in
 [docs/projects/01-flash-sale.md](docs/projects/01-flash-sale.md). Read the spec
 before working on any project task. [docs/try-it.md](docs/try-it.md) walks a
@@ -63,7 +64,8 @@ gateway (:5000): CORS → X-User-Id check (400 if malformed) → GCRA rate limit
    ├── products (:5001): Postgres product_service (products, reservations, sales)
    │      ├── /inventory/reserve|commit|release|stale: internal, for orders; CHECKOUT_MODE picks how
    │      ├── /sale/current: the sale page's data (product, live / committed / pending stock)
-   │      ├── Redis: listing cache products:{skip}:{limit} (TTL 60s); in redis mode also
+   │      ├── Redis: catalog cache catalog:list:{skip}:{limit} (60 s) and catalog:item:{id} (30 s),
+   │      │          versioned by catalog:version (CACHE_MODE: off | plain | protected); in redis mode also
    │      │          stock:{id} counters, resv:{id} hashes (reserved → committing) and resv:pending
    │      └── RabbitMQ: publishes add/update/delete to queue product_updates
    ├── cart (:5002): Postgres cart_service, one cart per shopper; reads products through an opossum breaker
@@ -92,6 +94,9 @@ Products and orders also have:
 Two more files hold logic that matters:
 - `services/products/utils/inventoryActions.js`: what the inventory can do in
   every checkout mode. Shared by the endpoints and the worker.
+- `services/products/utils/cache.js`: the read-through cache (versioned
+  entries, stampede protection, fail-open), with its catalog settings in
+  `catalogCache.js`.
 - `services/orders/jobs/`: the job processors (`confirmOrder.js`,
   `reconcile.js`).
 
@@ -197,11 +202,20 @@ data included.
   one opossum breaker, shared by every downstream URL. Orders' calls to
   `/inventory/*` deliberately bypass it, because 409 "sold out" answers would
   open it.
-- In the services, Redis, RabbitMQ and Meilisearch hosts are hardcoded to
-  `localhost` in `redisClient.js`, both `messageQueue.js`, `meiliClient.js` and
-  the `/sync` URL in `search.controller.js`. That works on the host. Moving
-  them to env vars is part of project 4. The gateway already reads
-  `REDIS_HOST` and `REDIS_PORT`.
+- In the services, RabbitMQ and Meilisearch hosts are hardcoded to
+  `localhost` in both `messageQueue.js`, `meiliClient.js` and the `/sync` URL
+  in `search.controller.js`. That works on the host. Moving them to env vars
+  is part of project 4. Every Redis client already reads `REDIS_HOST` and
+  `REDIS_PORT`.
+- **The catalog cache.** Every write to products calls
+  `catalogCache().invalidate()` (one `INCR catalog:version`) after the
+  database write and before publishing, because publishing can throw. Never
+  scan with `KEYS` or clear Redis with `flushall`/`flushdb` in app code: Redis
+  also holds the rate limits, sale counters, reservations and job queues.
+  Stock in cached products can be 30 s old; the reservation is the real stock
+  check. Responses say what the cache did in a `Cache-Status` header
+  (RFC 9211). Redis clients in the services fail fast (no offline queue);
+  copy `services/products/utils/redisClient.js`.
 - Never delete `stock:*` keys during a redis-mode sale. They reload from
   Postgres, which doesn't include reservations that haven't committed yet.
 - **Background jobs** (BullMQ 6). Every job must be safe to run twice:
@@ -233,8 +247,6 @@ post material.
 
 | Bug | Where | Project |
 |---|---|---|
-| `KEYS products:*` blocks Redis, and `removeAllProducts` runs `flushall`, which would also wipe a running sale's counters, its reservations, every rate limit and the job queues | `utils/cacheClear.js`, `product.controller.js` | 1 (phase 4) |
-| The products service's Redis client uses ioredis defaults (offline queue, 20 retries), so while Redis is down, requests that touch it (the home page's product grid) hang instead of failing fast. The gateway's `redisClient.js` shows the fix | `services/products/utils/redisClient.js` | 1 (phase 4) |
 | The search consumer indexes only name, price, stock, category and description, so search results lack image, colour and gender | `search/utils/messageQueue.js` | 2 |
 | The subcategory filter never applies: the frontend sends `subcategory`, the backend reads `subCategory` | `Categories.jsx`, `product.controller.js` | 2 |
 | Search fires on every keystroke with no debounce or cancel, so stale results can win | `Header.jsx` | 2 |
@@ -247,7 +259,7 @@ post material.
 
 | # | Project | Status | Spec |
 |---|---|---|---|
-| 1 | Flash Sale Mode (Redis) | **active**, phase 4 next | [01-flash-sale.md](docs/projects/01-flash-sale.md) |
+| 1 | Flash Sale Mode (Redis) | **active**, phase 5 (demo and posts) next | [01-flash-sale.md](docs/projects/01-flash-sale.md) |
 | 2 | Search 44k real products (Elasticsearch) | pipeline | [pipeline.md](docs/pipeline.md) |
 | 3 | Bulk catalog import (Supabase) | pipeline | [pipeline.md](docs/pipeline.md) |
 | 4 | Go to production (GCP, Cloudflare, Shopify webhooks) | pipeline | [pipeline.md](docs/pipeline.md) |

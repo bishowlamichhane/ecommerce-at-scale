@@ -4,7 +4,7 @@ dotenv.config({
 })
 import { UnrecoverableError, Worker } from "bullmq"
 import connectDB, { closeDB } from "./db/db.js"
-import redis from "./utils/redisClient.js"
+import redis, { cacheRedis } from "./utils/redisClient.js"
 import { INVENTORY_QUEUE, redisConnection } from "./utils/queue.js"
 import { checkoutMode, commitReservation } from "./utils/inventoryActions.js"
 
@@ -55,6 +55,7 @@ const shutdown = async () => {
     await worker.close()
     await closeDB()
     redis.disconnect()
+    cacheRedis.disconnect()
     process.exit(0)
 }
 process.on("SIGINT", shutdown)
